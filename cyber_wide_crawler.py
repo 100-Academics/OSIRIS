@@ -25,7 +25,7 @@ OUTPUT_FILE = "cyber_wide_data.jsonl"
 STATE_FILE = "crawler_state.json"
 SEEDS_FILE = "seeds.txt"
 
-USER_AGENT = "CyberWideCrawler/1.0 (public research crawler; +https://github.com/100-Academics/OSIRIS)""
+USER_AGENT = "CyberWideCrawler/1.0 (public research crawler; +https://github.com/100-Academics/OSIRIS)"
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
 MAX_PAGES_TOTAL = 200000
