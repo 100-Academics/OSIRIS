@@ -1,6 +1,6 @@
 # OSIRIS
 
-**O**pen-**S**ource **S**ecurity **I**ntel **R**ecursive **I**nternet **S**craper
+**O**pen-Source **S**ecurity **I**ntelligence **R**ecursive **I**nternet **S**craper
 
 A wide cybersecurity crawler that starts from a large seed list and dynamically discovers new domains across the internet — without relying on search engines. It scores pages for cybersecurity relevance, extracts CVE IDs, and writes all results to a JSONL file suitable for ML/AI training and security research.
 
@@ -143,7 +143,66 @@ Key settings at the top of `cyber_wide_crawler.py`:
 
 ---
 
-## Scope and responsible use
+## Using the data for training
+
+The `cyber_wide_data.jsonl` file is a standard newline-delimited JSON (NDJSON) file — one record per line — ready to drop into any ML pipeline.
+
+### Load with HuggingFace `datasets`
+
+```python
+from datasets import load_dataset
+
+ds = load_dataset("json", data_files="cyber_wide_data.jsonl", split="train")
+print(ds)
+# Dataset({features: ['scraped_at_utc', 'url', 'domain', 'title',
+#                      'relevance_score', 'cves_found', 'content_hash',
+#                      'word_count', 'code_block_count',
+#                      'content', 'content_snippet', 'code_blocks'],
+#          num_rows: ...})
+```
+
+### Filter and select columns
+
+```python
+# Keep only high-relevance pages with at least 100 words
+ds = ds.filter(lambda x: x["relevance_score"] >= 3 and x["word_count"] >= 100)
+
+# For plain text pretraining use the 'content' field
+texts = ds["content"]
+
+# For instruction / chat fine-tuning, combine title + content
+def to_prompt(example):
+    return {"text": f"Title: {example['title']}\n\n{example['content']}"}
+
+ds = ds.map(to_prompt)
+```
+
+### Load with plain Python (no extra libraries)
+
+```python
+import json
+
+records = []
+with open("cyber_wide_data.jsonl", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+
+print(f"Loaded {len(records)} records")
+```
+
+---
+
+## Running the tests
+
+```bash
+python -m pytest test_crawler.py -v
+```
+
+The test suite covers relevance scoring, CVE extraction, HTML parsing, link filtering, the JSONL write/read round-trip, content deduplication, and state save/load — without making any real network requests.
+
+---
 
 OSIRIS is a research and training-data tool. When running it:
 

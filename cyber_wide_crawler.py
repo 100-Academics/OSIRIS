@@ -211,6 +211,10 @@ def normalize_url(url: str) -> str:
         p = urlparse(url)
         scheme = p.scheme.lower()
         netloc = p.netloc.lower()
+        # Return the original string when the URL is not a valid absolute URL
+        # (no scheme or no host) to avoid producing garbage like "://...".
+        if not scheme or not netloc:
+            return url
         path = p.path or "/"
         query = p.query
         out = f"{scheme}://{netloc}{path}"
@@ -642,7 +646,7 @@ def crawl(seeds):
 
 
 def main():
-    print("[start] OSIRIS — Open-Source Security Intel Recursive Internet Scraper")
+    print("[start] OSIRIS — Open-Source Security Intelligence Recursive Internet Scraper")
     print("[start] Dynamic domain discovery enabled. Search engines excluded.")
     print(f"[start] Output JSONL: {OUTPUT_FILE}")
     print("[start] Press Ctrl+C anytime for safe save and exit.")
