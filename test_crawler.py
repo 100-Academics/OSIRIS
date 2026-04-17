@@ -598,7 +598,7 @@ class TestEnqueue(unittest.TestCase):
 
     def test_blocked_domain_not_enqueued(self):
         cwc.enqueue("https://google.com/search?q=exploit")
-        self.assertFalse(any("google.com" in u for u in cwc.queued_set))
+        self.assertEqual(len(cwc.queued_set), 0)
 
     def test_non_http_not_enqueued(self):
         cwc.enqueue("ftp://example.com/file")

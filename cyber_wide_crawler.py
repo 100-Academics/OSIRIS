@@ -646,7 +646,7 @@ def crawl(seeds):
 
 
 def main():
-    print("[start] OSIRIS — Open-Source Security Intelligence Recursive Internet Scraper")
+    print("[start] OSIRIS — Open Security Intelligence Recursive Internet Scraper")
     print("[start] Dynamic domain discovery enabled. Search engines excluded.")
     print(f"[start] Output JSONL: {OUTPUT_FILE}")
     print("[start] Press Ctrl+C anytime for safe save and exit.")

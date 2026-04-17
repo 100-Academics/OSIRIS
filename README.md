@@ -1,6 +1,6 @@
 # OSIRIS
 
-**O**pen-Source **S**ecurity **I**ntelligence **R**ecursive **I**nternet **S**craper
+**O**pen **S**ecurity **I**ntelligence **R**ecursive **I**nternet **S**craper
 
 A wide cybersecurity crawler that starts from a large seed list and dynamically discovers new domains across the internet — without relying on search engines. It scores pages for cybersecurity relevance, extracts CVE IDs, and writes all results to a JSONL file suitable for ML/AI training and security research.
 
