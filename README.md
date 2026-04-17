@@ -10,7 +10,7 @@ A wide cybersecurity crawler that starts from a large seed list and dynamically 
 
 - **Dynamic domain discovery** — follows outbound links to reach new domains continuously; not limited to the seed list
 - **Clean body extraction** — uses [trafilatura](https://trafilatura.readthedocs.io/) to extract the article body, stripping navigation, sidebars, ads, and boilerplate before storage
-- **Relevance scoring** — ranks pages using 70+ cybersecurity keywords (CVE, exploit, shellcode, buffer overflow, ssrf, pentest, ctf, metasploit, etc.); CVE mentions add extra weight
+- **Relevance scoring** — ranks pages using 190+ cybersecurity keywords (CVE, exploit, shellcode, buffer overflow, ssrf, pentest, ctf, metasploit, UAC bypass, sudo abuse, etc.); CVE mentions add extra weight
 - **CVE extraction** — finds all `CVE-YYYY-NNNNN` identifiers per page and stores them as a proper JSON array
 - **Code block extraction** — separately captures `<pre>` / `<code>` snippets (PoC exploits, shellcode, YARA rules, config examples) in a dedicated field
 - **Content deduplication** — SHA-256 of the cleaned body text prevents the same article (syndicated on multiple sites) from appearing twice in the dataset
@@ -36,6 +36,8 @@ Each line of `cyber_wide_data.jsonl` is a JSON object:
   "relevance_score": 9,
   "cves_found": ["CVE-2024-1234", "CVE-2024-5678"],
   "content_hash": "a3f1c8...",
+  "word_count": 842,
+  "code_block_count": 2,
   "content": "A critical remote code execution vulnerability was discovered in...",
   "content_snippet": "A critical remote code execution vulnerability...",
   "code_blocks": ["#!/usr/bin/env python3\nimport socket\n..."]
@@ -51,6 +53,8 @@ Each line of `cyber_wide_data.jsonl` is a JSON object:
 | `relevance_score` | Integer score based on cybersecurity keyword matches; higher = more relevant |
 | `cves_found` | JSON array of CVE IDs found on the page |
 | `content_hash` | SHA-256 of the full cleaned body text; use for near-duplicate removal at training time |
+| `word_count` | Number of words in the cleaned body text |
+| `code_block_count` | Number of code snippets extracted from this page |
 | `content` | Full cleaned article body (up to 50 000 characters); boilerplate stripped by trafilatura |
 | `content_snippet` | First 1200 characters of `content`; convenience field for quick inspection |
 | `code_blocks` | Array of code snippets extracted from `<pre>`/`<code>` tags (PoC, shellcode, scripts, rules) |

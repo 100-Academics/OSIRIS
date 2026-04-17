@@ -37,7 +37,6 @@ SAVE_STATE_EVERY_N_PAGES = 50
 SLEEP_RANGE_SECONDS = (0.2, 0.8)
 
 MAX_CONTENT_CHARS = 50000   # full cleaned body text stored in the output
-MAX_TEXT_CHARS = 5000       # kept for legacy relevance-scoring window
 MAX_LINKS_PER_PAGE = 200
 MAX_PAGES_PER_DOMAIN = 120
 MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN = 35
@@ -142,6 +141,31 @@ _KEYWORD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Pre-compiled priority-link pattern — avoids rebuilding a list on every call.
+_PRIORITY_RE = re.compile(
+    r"advisory|security|cve|vuln|vulnerability|exploit|incident|threat|malware|ransomware|patch",
+    re.IGNORECASE,
+)
+
+# File extensions that are never HTML pages; skip them in extract_links to avoid
+# wasting a request slot on binary downloads.
+_SKIP_EXTS = frozenset([
+    ".pdf", ".zip", ".gz", ".tar", ".exe", ".msi", ".dmg", ".pkg",
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".webp", ".bmp",
+    ".mp4", ".mp3", ".avi", ".mov", ".wmv", ".flac", ".ogg",
+    ".css", ".js", ".xml", ".rss", ".atom", ".json", ".csv",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".rtf",
+    ".iso", ".bin", ".rar", ".7z",
+])
+
+# Use lxml when available (trafilatura already depends on it) — roughly 3× faster
+# than html.parser for large pages; fall back transparently if not installed.
+try:
+    import lxml  # noqa: F401
+    _HTML_PARSER = "lxml"
+except ImportError:
+    _HTML_PARSER = "html.parser"
+
 # Fallback seeds used only if seeds.txt is missing
 DEFAULT_SEEDS = [
     "https://nvd.nist.gov/",
@@ -218,14 +242,6 @@ def is_blocked(url: str) -> bool:
     return False
 
 
-def text_hash(*parts) -> str:
-    x = hashlib.sha256()
-    for p in parts:
-        x.update((p or "").encode("utf-8", errors="ignore"))
-        x.update(b"\x1e")
-    return x.hexdigest()
-
-
 def setup_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
@@ -242,7 +258,6 @@ def setup_session() -> requests.Session:
     s.mount("https://", adapter)
     s.headers.update({"User-Agent": USER_AGENT})
     return s
-
 
 
 def relevance_score(title: str, text: str) -> int:
@@ -281,7 +296,7 @@ def extract_code_blocks(soup: BeautifulSoup) -> list:
 
 
 def extract_text_and_title(html: str, url: str = ""):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, _HTML_PARSER)
     for t in soup(["script", "style", "noscript", "svg"]):
         t.decompose()
 
@@ -386,8 +401,13 @@ def extract_links(base_url: str, soup: BeautifulSoup):
         if href.startswith(("javascript:", "mailto:", "tel:")):
             continue
         full = normalize_url(urljoin(base_url, href))
-        if is_http(full):
-            links.append(full)
+        if not is_http(full):
+            continue
+        # Skip binary / non-HTML resources to avoid wasting request slots
+        ext = os.path.splitext(urlparse(full).path)[1].lower()
+        if ext in _SKIP_EXTS:
+            continue
+        links.append(full)
         if len(links) >= MAX_LINKS_PER_PAGE:
             break
     return links
@@ -403,8 +423,7 @@ def flush_records():
         records_buffer = []
         rows_saved += len(to_write)
     with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-        for record in to_write:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.write("\n".join(json.dumps(r, ensure_ascii=False) for r in to_write) + "\n")
         f.flush()
         os.fsync(f.fileno())
 
@@ -494,12 +513,7 @@ def graceful_shutdown(signum=None, frame=None):
 
 
 def should_prioritize_link(link: str) -> bool:
-    l = link.lower()
-    priority_markers = [
-        "advisory", "security", "cve", "vuln", "vulnerability", "exploit",
-        "incident", "threat", "malware", "ransomware", "patch",
-    ]
-    return any(m in l for m in priority_markers)
+    return bool(_PRIORITY_RE.search(link))
 
 
 def record_if_relevant(url: str, title: str, text: str, code_blocks: list):
@@ -532,7 +546,7 @@ def record_if_relevant(url: str, title: str, text: str, code_blocks: list):
         "relevance_score": score,
         "cves_found": cves,
         "content_hash": content_hash,
-        "word_count": len(text.split()),
+        "word_count": text.count(" ") + 1 if text else 0,
         "code_block_count": len(code_blocks),
         "content": text,
         "content_snippet": text[:1200],
@@ -582,6 +596,9 @@ def crawl(seeds):
             r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             final_url = normalize_url(r.url)
 
+            if r.status_code < 200 or r.status_code >= 300:
+                continue
+
             if is_blocked(final_url):
                 continue
 
@@ -613,9 +630,11 @@ def crawl(seeds):
 
             time.sleep(random.uniform(*SLEEP_RANGE_SECONDS))
 
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            print(f"[warn] request failed {url}: {exc}", file=sys.stderr)
             continue
-        except Exception:
+        except Exception as exc:
+            print(f"[warn] unexpected error {url}: {exc}", file=sys.stderr)
             continue
 
     flush_records()
