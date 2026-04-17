@@ -1,0 +1,238 @@
+# OSIRIS Seed URLs
+# One URL per line. Lines starting with # are comments and are ignored.
+# Add or remove URLs freely. The crawler will discover new domains from links found on these pages.
+
+# -------------------------
+# Government / National CERT / Standards
+# -------------------------
+https://www.cisa.gov/
+https://www.cisa.gov/news-events/cybersecurity-advisories
+https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+https://nvd.nist.gov/
+https://nvd.nist.gov/vuln/full-listing
+https://www.nist.gov/cyberframework
+https://www.enisa.europa.eu/
+https://www.ncsc.gov.uk/
+https://www.cyber.gov.au/
+https://www.ccn-cert.cni.es/
+https://www.bsi.bund.de/
+https://www.cert.ssi.gouv.fr/
+https://www.ncsc.nl/
+https://www.incibe.es/
+https://www.cisa.gov/stopransomware
+
+# -------------------------
+# CERT / CSIRT / Coordination
+# -------------------------
+https://www.cert.org/
+https://www.kb.cert.org/vuls/
+https://www.first.org/
+https://www.first.org/members/
+https://www.apcert.org/
+https://www.trusted-introducer.org/
+https://www.us-cert.gov/ncas/alerts
+
+# -------------------------
+# Vulnerability Databases / Advisories
+# -------------------------
+https://www.cve.org/
+https://www.cve.org/ResourcesSupport/AllResources
+https://www.exploit-db.com/
+https://www.securityfocus.com/
+https://github.com/advisories
+https://www.opencve.io/
+https://vuldb.com/
+https://www.rapid7.com/db/
+https://www.tenable.com/cve
+https://www.qualys.com/research/security-advisories/
+https://www.jpcert.or.jp/english/
+https://www.zerodayinitiative.com/advisories/
+https://www.packetstormsecurity.com/files/
+https://www.msrc.microsoft.com/update-guide
+
+# -------------------------
+# Major Vendor Security Advisories
+# -------------------------
+https://support.apple.com/en-us/HT201222
+https://source.android.com/security/bulletin
+https://security.googleblog.com/
+https://chromereleases.googleblog.com/
+https://msrc.microsoft.com/blog/
+https://security.intel.com/
+https://www.amd.com/en/resources/product-security.html
+https://www.oracle.com/security-alerts/
+https://www.ibm.com/support/pages/security-bulletins
+https://www.redhat.com/en/topics/security
+https://access.redhat.com/security/security-updates/
+https://ubuntu.com/security/notices
+https://security.debian.org/
+https://www.suse.com/security/cve/
+https://security.archlinux.org/
+https://www.kernel.org/
+https://www.mozilla.org/en-US/security/advisories/
+https://www.apache.org/security/
+https://www.nginx.com/blog/category/security/
+https://nodejs.org/en/blog/vulnerability/
+https://www.php.net/archive/
+https://www.python.org/news/security/
+https://www.djangoproject.com/weblog/
+https://www.drupal.org/security
+https://wordpress.org/news/category/security/
+https://www.jenkins.io/security/advisories/
+https://gitlab.com/gitlab-org/cves/
+https://about.gitlab.com/releases/categories/releases/
+https://github.blog/category/security/
+https://about.gitlab.com/security/
+https://www.atlassian.com/trust/security/advisories
+https://www.cisco.com/c/en/us/support/web/tsd-cisco-worldwide-contacts.html
+https://sec.cloudapps.cisco.com/security/center/publicationListing.x
+https://security.paloaltonetworks.com/
+https://www.fortiguard.com/psirt
+https://support.hpe.com/hpesc/public/security-bulletins
+https://security.netapp.com/advisory/
+https://security.synology.com/
+https://www.tp-link.com/us/support/security/
+https://www.dell.com/support/security/en-us
+https://www.vmware.com/security/advisories.html
+https://www.splunk.com/en_us/product-security.html
+https://www.okta.com/security/
+https://www.cloudflare.com/trust-hub/security/
+https://www.zoom.com/en/trust/security-bulletin/
+https://www.mongodb.com/alerts
+https://www.postgresql.org/support/security/
+https://mariadb.com/kb/en/security/
+https://www.mysql.com/support/security/
+https://www.elastic.co/community/security
+https://kubernetes.io/blog/
+https://kubernetes.io/releases/
+https://www.docker.com/blog/
+https://helm.sh/blog/
+https://istio.io/latest/news/
+https://grafana.com/security/security-advisories/
+https://prometheus.io/blog/
+
+# -------------------------
+# Security Companies / Threat Research
+# -------------------------
+https://unit42.paloaltonetworks.com/
+https://blog.talosintelligence.com/
+https://www.crowdstrike.com/blog/
+https://www.mandiant.com/resources/blog
+https://research.checkpoint.com/
+https://securelist.com/
+https://www.welivesecurity.com/
+https://labs.withsecure.com/publications
+https://www.trendmicro.com/en_us/research.html
+https://www.sentinelone.com/labs/
+https://www.sophos.com/en-us/threat-center
+https://www.proofpoint.com/us/blog
+https://www.recordedfuture.com/blog
+https://www.group-ib.com/blog/
+https://blog.torproject.org/
+https://blog.malwarebytes.com/
+https://www.eset.com/int/about/newsroom/research/
+https://www.kaspersky.com/blog/
+https://www.rapid7.com/blog/
+https://www.tenable.com/blog
+https://www.qualys.com/blog/
+https://www.securityweek.com/
+https://www.darkreading.com/
+https://www.bleepingcomputer.com/news/security/
+https://therecord.media/
+https://www.bankinfosecurity.com/
+https://www.helpnetsecurity.com/
+https://portswigger.net/research
+https://www.sans.org/blog/
+https://isc.sans.edu/
+https://www.schneier.com/
+https://arstechnica.com/security/
+https://www.theregister.com/security/
+
+# -------------------------
+# Open Source Security Projects / Feeds
+# -------------------------
+https://owasp.org/
+https://owasp.org/www-project-top-ten/
+https://www.mitre.org/
+https://attack.mitre.org/
+https://capec.mitre.org/
+https://cwe.mitre.org/
+https://oasis-open.github.io/cti-documentation/
+https://www.stixproject.org/
+https://www.openwall.com/lists/
+https://oss-security.openwall.org/wiki/mailing-lists/oss-security
+https://seclists.org/
+https://www.vulncheck.com/
+https://osv.dev/
+https://github.com/ossf
+https://openssf.org/blog/
+https://slsa.dev/
+https://www.sigstore.dev/
+https://deps.dev/
+https://securitylab.github.com/
+https://github.com/trending
+https://github.com/topics/security
+https://github.com/topics/cybersecurity
+https://github.com/topics/vulnerability
+
+# -------------------------
+# Bug Bounty / Disclosure Communities
+# -------------------------
+https://hackerone.com/hacktivity
+https://bugcrowd.com/blog/
+https://www.intigriti.com/researchers/blog
+https://www.yeswehack.com/learn-bug-bounty
+https://huntr.com/
+https://www.openbugbounty.org/
+https://www.synack.com/blog/
+https://www.hackerone.com/blog
+
+# -------------------------
+# Community / Discussion Sources
+# -------------------------
+https://www.reddit.com/r/cybersecurity/
+https://www.reddit.com/r/netsec/
+https://www.reddit.com/r/blueteamsec/
+https://www.reddit.com/r/redteamsec/
+https://www.reddit.com/r/malware/
+https://www.reddit.com/r/AskNetsec/
+https://lobste.rs/t/security
+https://news.ycombinator.com/
+https://infosec.exchange/
+https://hachyderm.io/
+
+# -------------------------
+# Podcasts / Newsletters / Aggregators
+# -------------------------
+https://krebsonsecurity.com/
+https://www.riskiq.com/blog/
+https://danielmiessler.com/
+https://www.vulnu.com/p/vulnu-security-newsletter
+https://www.cybersecuritydive.com/
+https://thehackernews.com/
+https://cyberscoop.com/
+https://www.infosecurity-magazine.com/
+https://www.scworld.com/
+https://www.securitymagazine.com/
+https://www.wired.com/tag/cybersecurity/
+
+# -------------------------
+# Cloud Security
+# -------------------------
+https://aws.amazon.com/security/security-bulletins/
+https://azure.microsoft.com/en-us/updates/
+https://cloud.google.com/support/bulletins
+https://www.digitalocean.com/security
+https://www.oracle.com/cloud/security/
+https://www.alibabacloud.com/trust-center/security-bulletins
+
+# -------------------------
+# Wikipedia / Broad Entry Points
+# -------------------------
+https://en.wikipedia.org/wiki/Computer_security
+https://en.wikipedia.org/wiki/Common_Vulnerabilities_and_Exposures
+https://en.wikipedia.org/wiki/List_of_computer_security_software
+https://en.wikipedia.org/wiki/Computer_virus
+https://en.wikipedia.org/wiki/Cyberattack
+https://en.wikipedia.org/wiki/Zero-day_(computing)
+https://en.wikipedia.org/wiki/Data_breach
