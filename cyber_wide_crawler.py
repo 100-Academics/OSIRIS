@@ -159,9 +159,6 @@ def setup_session() -> requests.Session:
     return s
 
 
-def ensure_csv_header():
-    pass  # kept for compatibility; output is now JSONL (no header needed)
-
 
 def relevance_score(title: str, text: str) -> int:
     blob = f"{title} {text}".lower()
@@ -244,13 +241,15 @@ def flush_records():
     with save_lock:
         if not records_buffer:
             return
-        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-            for record in records_buffer:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        rows_saved += len(records_buffer)
+        # Swap buffer atomically so new appends go to a fresh list while we write the old one
+        to_write = records_buffer
         records_buffer = []
+        rows_saved += len(to_write)
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+        for record in to_write:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def save_state():
