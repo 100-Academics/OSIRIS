@@ -546,7 +546,7 @@ def record_if_relevant(url: str, title: str, text: str, code_blocks: list):
         "relevance_score": score,
         "cves_found": cves,
         "content_hash": content_hash,
-        "word_count": text.count(" ") + 1 if text else 0,
+        "word_count": len(text.split()),
         "code_block_count": len(code_blocks),
         "content": text,
         "content_snippet": text[:1200],
