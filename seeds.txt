@@ -30,7 +30,7 @@ https://www.first.org/
 https://www.first.org/members/
 https://www.apcert.org/
 https://www.trusted-introducer.org/
-https://www.us-cert.gov/ncas/alerts
+https://www.cisa.gov/uscert/ncas/alerts
 
 # -------------------------
 # Vulnerability Databases / Advisories
@@ -71,7 +71,7 @@ https://security.archlinux.org/
 https://www.kernel.org/
 https://www.mozilla.org/en-US/security/advisories/
 https://www.apache.org/security/
-https://www.nginx.com/blog/category/security/
+https://www.f5.com/company/blog
 https://nodejs.org/en/blog/vulnerability/
 https://www.php.net/archive/
 https://www.python.org/news/security/
@@ -158,7 +158,7 @@ https://attack.mitre.org/
 https://capec.mitre.org/
 https://cwe.mitre.org/
 https://oasis-open.github.io/cti-documentation/
-https://www.stixproject.org/
+https://oasis-open.github.io/cti-documentation/stix/intro
 https://www.openwall.com/lists/
 https://oss-security.openwall.org/wiki/mailing-lists/oss-security
 https://seclists.org/
@@ -205,9 +205,9 @@ https://hachyderm.io/
 # Podcasts / Newsletters / Aggregators
 # -------------------------
 https://krebsonsecurity.com/
-https://www.riskiq.com/blog/
+https://www.microsoft.com/en-us/security/blog/
 https://danielmiessler.com/
-https://www.vulnu.com/p/vulnu-security-newsletter
+https://tldrsec.com/
 https://www.cybersecuritydive.com/
 https://thehackernews.com/
 https://cyberscoop.com/

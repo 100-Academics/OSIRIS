@@ -1,4 +1,3 @@
-import csv
 import os
 import re
 import sys
@@ -20,7 +19,7 @@ from urllib3.util.retry import Retry
 # =========================
 # CONFIG
 # =========================
-OUTPUT_CSV = "cyber_wide_data.csv"
+OUTPUT_FILE = "cyber_wide_data.jsonl"
 STATE_FILE = "crawler_state.json"
 SEEDS_FILE = "seeds.txt"
 
@@ -161,20 +160,7 @@ def setup_session() -> requests.Session:
 
 
 def ensure_csv_header():
-    if not os.path.exists(OUTPUT_CSV) or os.path.getsize(OUTPUT_CSV) == 0:
-        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "scraped_at_utc",
-                "url",
-                "domain",
-                "title",
-                "relevance_score",
-                "cves_found",
-                "content_snippet",
-            ])
-            f.flush()
-            os.fsync(f.fileno())
+    pass  # kept for compatibility; output is now JSONL (no header needed)
 
 
 def relevance_score(title: str, text: str) -> int:
@@ -258,10 +244,9 @@ def flush_records():
     with save_lock:
         if not records_buffer:
             return
-        ensure_csv_header()
-        with open(OUTPUT_CSV, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerows(records_buffer)
+        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+            for record in records_buffer:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
             f.flush()
             os.fsync(f.fileno())
         rows_saved += len(records_buffer)
@@ -376,16 +361,16 @@ def record_if_relevant(url: str, title: str, text: str):
         return
     seen_records.add(rid)
 
-    row = [
-        now_iso(),
-        url,
-        h,
-        title,
-        score,
-        ";".join(cves),
-        text[:1200],
-    ]
-    records_buffer.append(row)
+    record = {
+        "scraped_at_utc": now_iso(),
+        "url": url,
+        "domain": h,
+        "title": title,
+        "relevance_score": score,
+        "cves_found": cves,
+        "content_snippet": text[:1200],
+    }
+    records_buffer.append(record)
 
     if len(records_buffer) >= FLUSH_EVERY_N_RECORDS:
         flush_records()
@@ -469,7 +454,7 @@ def crawl(seeds):
 def main():
     print("[start] OSIRIS — Open-Source Security Intel Recursive Internet Scraper")
     print("[start] Dynamic domain discovery enabled. Search engines excluded.")
-    print(f"[start] Output CSV: {OUTPUT_CSV}")
+    print(f"[start] Output JSONL: {OUTPUT_FILE}")
     print("[start] Press Ctrl+C anytime for safe save and exit.")
 
     signal.signal(signal.SIGINT, graceful_shutdown)
@@ -506,7 +491,7 @@ def main():
 
     elapsed = time.time() - started
     print(f"[done] pages_processed={pages_processed}, rows_saved={rows_saved}, elapsed={elapsed:.1f}s")
-    print(f"[done] CSV={OUTPUT_CSV}  STATE={STATE_FILE}")
+    print(f"[done] JSONL={OUTPUT_FILE}  STATE={STATE_FILE}")
 
 
 if __name__ == "__main__":
