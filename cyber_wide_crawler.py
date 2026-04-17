@@ -102,7 +102,45 @@ CYBER_KEYWORDS = [
     "ctf", "capture the flag", "writeup", "proof of concept", "poc",
     "reverse engineering", "binary analysis", "fuzzing", "afl",
     "static analysis", "dynamic analysis", "sandbox",
+    # Windows privilege escalation / admin elevation
+    "uac bypass", "user account control", "uac",
+    "token impersonation", "access token manipulation",
+    "seimpersonateprivilege", "sedebugprivilege", "seassignprimarytokenprivilege",
+    "printspoofer", "juicy potato", "rogue potato", "sweet potato", "hot potato",
+    "runas", "psexec",
+    "local privilege escalation", "lpe",
+    "dll hijacking", "dll injection", "dll side-loading",
+    "process injection", "process hollowing",
+    "alwaysinstallelevated", "unquoted service path",
+    "weak service permissions", "named pipe impersonation",
+    "pass-the-hash", "pass-the-ticket", "overpass-the-hash",
+    "kerberoasting", "asreproasting", "golden ticket", "silver ticket",
+    "applocker bypass", "amsi bypass", "windows defender bypass",
+    "lsass dump", "lsass", "ntlm relay", "ntlm hash",
+    "scheduled task abuse", "registry run key", "autorun persistence",
+    # Linux sudo / SUID privilege escalation
+    "sudo -l", "sudoers", "sudo misconfiguration", "sudo abuse",
+    "suid binary", "suid exploitation", "sgid",
+    "setuid", "setgid", "capabilities abuse", "cap_setuid",
+    "linux privilege escalation", "linux lpe",
+    "cron job abuse", "world-writable", "weak file permissions",
+    "path hijacking", "ld_preload", "ld_library_path hijack",
+    "pkexec", "polkit", "pwnkit",
+    "dirtycow", "dirty cow", "dirty pipe",
+    "kernel exploit", "kernel module injection",
+    "docker escape", "container escape", "namespace escape",
+    "nfs no_root_squash", "lxd privilege escalation",
+    "/etc/passwd writable", "/etc/shadow", "passwd file",
 ]
+
+# Pre-compiled patterns — built once at import time for fast repeated matching.
+# _KEYWORD_RE uses alternation over every keyword so a single regex pass replaces
+# the O(k) loop of individual `in` checks.
+_CVE_RE = re.compile(r"\bcve-\d{4}-\d{4,7}\b", re.IGNORECASE)
+_KEYWORD_RE = re.compile(
+    "|".join(re.escape(kw) for kw in CYBER_KEYWORDS),
+    re.IGNORECASE,
+)
 
 # Fallback seeds used only if seeds.txt is missing
 DEFAULT_SEEDS = [
@@ -208,18 +246,16 @@ def setup_session() -> requests.Session:
 
 
 def relevance_score(title: str, text: str) -> int:
-    blob = f"{title} {text}".lower()
-    score = 0
-    for kw in CYBER_KEYWORDS:
-        if kw in blob:
-            score += 1
-    score += len(re.findall(r"\bcve-\d{4}-\d{4,7}\b", blob)) * 2
+    blob = f"{title} {text}"
+    # Each distinct keyword matched counts once; CVE IDs get an extra +2 each.
+    score = len({m.lower() for m in _KEYWORD_RE.findall(blob)})
+    score += len(_CVE_RE.findall(blob)) * 2
     return score
 
 
-def extract_cves(title: str, text: str):
-    blob = f"{title} {text}".lower()
-    return sorted(set(m.upper() for m in re.findall(r"\bcve-\d{4}-\d{4,7}\b", blob)))
+def extract_cves(title: str, text: str) -> list:
+    blob = f"{title} {text}"
+    return sorted({m.upper() for m in _CVE_RE.findall(blob)})
 
 
 def extract_code_blocks(soup: BeautifulSoup) -> list:
@@ -287,22 +323,32 @@ def robots_allowed(session: requests.Session, url: str) -> bool:
     h = parsed.netloc.lower()
     robots_url = f"{parsed.scheme}://{h}/robots.txt"
 
+    now = time.time()
+    # Fast path: return cached result without doing any I/O.
     with robots_lock:
         entry = robots_cache.get(h)
-        now = time.time()
         if entry and now < entry[1]:
-            rp = entry[0]
+            return entry[0].can_fetch(USER_AGENT, url)
+
+    # Cache miss — fetch robots.txt *outside* the lock so other threads are not blocked.
+    rp = urllib.robotparser.RobotFileParser()
+    rp.set_url(robots_url)
+    try:
+        resp = session.get(robots_url, timeout=10, allow_redirects=True)
+        if resp.status_code == 200:
+            rp.parse(resp.text.splitlines())
+        # 404 / other -> treat as no restrictions (rp stays unparsed -> can_fetch returns True)
+    except Exception:
+        pass
+
+    with robots_lock:
+        # Another call may have populated the cache while we were fetching; keep the
+        # fresher entry to avoid redundant re-fetches.
+        entry = robots_cache.get(h)
+        if not entry or now >= entry[1]:
+            robots_cache[h] = (rp, time.time() + ROBOTS_CACHE_TTL)
         else:
-            rp = urllib.robotparser.RobotFileParser()
-            rp.set_url(robots_url)
-            try:
-                resp = session.get(robots_url, timeout=10, allow_redirects=True)
-                if resp.status_code == 200:
-                    rp.parse(resp.text.splitlines())
-                # 404 / other -> treat as no restrictions (rp stays unparsed -> can_fetch returns True)
-            except Exception:
-                pass
-            robots_cache[h] = (rp, now + ROBOTS_CACHE_TTL)
+            rp = entry[0]
 
     return rp.can_fetch(USER_AGENT, url)
 
@@ -486,6 +532,8 @@ def record_if_relevant(url: str, title: str, text: str, code_blocks: list):
         "relevance_score": score,
         "cves_found": cves,
         "content_hash": content_hash,
+        "word_count": len(text.split()),
+        "code_block_count": len(code_blocks),
         "content": text,
         "content_snippet": text[:1200],
         "code_blocks": code_blocks,
