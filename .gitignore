@@ -1,0 +1,22 @@
+# Crawler output data
+cyber_wide_data.jsonl
+cyber_wide_data.csv
+
+# Crawler state (resume file)
+crawler_state.json
+crawler_state.json.tmp
+
+# Python virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
