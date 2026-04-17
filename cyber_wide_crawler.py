@@ -25,26 +25,26 @@ OUTPUT_FILE = "cyber_wide_data.jsonl"
 STATE_FILE = "crawler_state.json"
 SEEDS_FILE = "seeds.txt"
 
-USER_AGENT = "CyberWideCrawler/1.0 (public research crawler)"
+USER_AGENT = "CyberWideCrawler/1.0 (public research crawler; +https://github.com/100-Academics/OSIRIS)""
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
-MAX_PAGES_TOTAL = 20000
+MAX_PAGES_TOTAL = 200000
 MAX_QUEUE_SIZE = 120000
 
 AUTOSAVE_SECONDS = 20
 FLUSH_EVERY_N_RECORDS = 25
 SAVE_STATE_EVERY_N_PAGES = 50
-SLEEP_RANGE_SECONDS = (0.2, 0.8)
+SLEEP_RANGE_SECONDS = (0.1, 0.5)
 
 MAX_CONTENT_CHARS = 50000   # full cleaned body text stored in the output
 MAX_LINKS_PER_PAGE = 200
-MAX_PAGES_PER_DOMAIN = 120
+MAX_PAGES_PER_DOMAIN = 320
 MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN = 35
 MIN_CONTENT_LENGTH = 200    # skip stub / redirect / error pages
 
 # Code-block extraction limits (for the code_blocks field)
-MAX_CODE_BLOCKS = 20
-MAX_CODE_BLOCK_CHARS = 2000
+MAX_CODE_BLOCKS = 100
+MAX_CODE_BLOCK_CHARS = 200000
 
 ROBOTS_CACHE_TTL = 3600     # seconds to cache robots.txt per domain
 
