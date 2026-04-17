@@ -9,9 +9,13 @@ A wide cybersecurity crawler that starts from a large seed list and dynamically 
 ## Features
 
 - **Dynamic domain discovery** — follows outbound links to reach new domains continuously; not limited to the seed list
-- **Relevance scoring** — ranks pages using cybersecurity keywords (CVE, exploit, advisory, ransomware, etc.); CVE mentions add extra weight
+- **Clean body extraction** — uses [trafilatura](https://trafilatura.readthedocs.io/) to extract the article body, stripping navigation, sidebars, ads, and boilerplate before storage
+- **Relevance scoring** — ranks pages using 70+ cybersecurity keywords (CVE, exploit, shellcode, buffer overflow, ssrf, pentest, ctf, metasploit, etc.); CVE mentions add extra weight
 - **CVE extraction** — finds all `CVE-YYYY-NNNNN` identifiers per page and stores them as a proper JSON array
+- **Code block extraction** — separately captures `<pre>` / `<code>` snippets (PoC exploits, shellcode, YARA rules, config examples) in a dedicated field
+- **Content deduplication** — SHA-256 of the cleaned body text prevents the same article (syndicated on multiple sites) from appearing twice in the dataset
 - **JSONL output** — one JSON record per line, ideal for ML training pipelines (HuggingFace `datasets`, OpenAI fine-tuning, PyTorch DataLoader)
+- **robots.txt compliance** — fetches and caches each domain's `robots.txt` (TTL 1 hour); skips disallowed URLs
 - **Autosave** — flushes data and saves crawler state every 20 seconds
 - **Graceful shutdown** — `Ctrl+C` or `SIGTERM` safely flushes all buffered data before exit
 - **Resume** — state is persisted to `crawler_state.json`; re-running continues from where it left off
@@ -31,7 +35,10 @@ Each line of `cyber_wide_data.jsonl` is a JSON object:
   "title": "Critical RCE in Example Product",
   "relevance_score": 9,
   "cves_found": ["CVE-2024-1234", "CVE-2024-5678"],
-  "content_snippet": "A critical remote code execution vulnerability..."
+  "content_hash": "a3f1c8...",
+  "content": "A critical remote code execution vulnerability was discovered in...",
+  "content_snippet": "A critical remote code execution vulnerability...",
+  "code_blocks": ["#!/usr/bin/env python3\nimport socket\n..."]
 }
 ```
 
@@ -43,7 +50,10 @@ Each line of `cyber_wide_data.jsonl` is a JSON object:
 | `title` | Page `<title>` or first `<h1>` |
 | `relevance_score` | Integer score based on cybersecurity keyword matches; higher = more relevant |
 | `cves_found` | JSON array of CVE IDs found on the page |
-| `content_snippet` | First 1200 characters of visible page text |
+| `content_hash` | SHA-256 of the full cleaned body text; use for near-duplicate removal at training time |
+| `content` | Full cleaned article body (up to 50 000 characters); boilerplate stripped by trafilatura |
+| `content_snippet` | First 1200 characters of `content`; convenience field for quick inspection |
+| `code_blocks` | Array of code snippets extracted from `<pre>`/`<code>` tags (PoC, shellcode, scripts, rules) |
 
 ---
 
@@ -122,7 +132,10 @@ Key settings at the top of `cyber_wide_crawler.py`:
 | `MAX_QUEUE_SIZE` | 120000 | Max URLs held in memory queue |
 | `AUTOSAVE_SECONDS` | 20 | How often to flush and save state |
 | `SLEEP_RANGE_SECONDS` | (0.2, 0.8) | Random delay between requests |
-| `MAX_TEXT_CHARS` | 5000 | Max chars of text parsed per page |
+| `MAX_CONTENT_CHARS` | 50000 | Max chars of cleaned body text stored per page |
+| `MIN_CONTENT_LENGTH` | 200 | Skip pages with fewer than this many content characters |
+| `MAX_CODE_BLOCKS` | 20 | Max code snippets extracted per page |
+| `ROBOTS_CACHE_TTL` | 3600 | Seconds to cache a domain's robots.txt |
 
 ---
 
@@ -132,7 +145,7 @@ OSIRIS is a research and training-data tool. When running it:
 
 - It sends `User-Agent: CyberWideCrawler/1.0 (public research crawler)` with every request
 - It respects per-domain page budgets and inserts random delays between requests
-- It does **not** bypass authentication, robots.txt enforcement, or rate-limit controls
+- It fetches and honours each domain's `robots.txt` before crawling any page on that domain
 - Do not use this tool against systems you do not have permission to crawl
 
 ---
@@ -141,4 +154,5 @@ OSIRIS is a research and training-data tool. When running it:
 
 - [`requests`](https://pypi.org/project/requests/) — HTTP client
 - [`beautifulsoup4`](https://pypi.org/project/beautifulsoup4/) — HTML parsing
+- [`trafilatura`](https://trafilatura.readthedocs.io/) — main-content extraction (strips nav/footer/ads)
 - [`urllib3`](https://pypi.org/project/urllib3/) — HTTP connection pooling (used by requests)

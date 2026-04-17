@@ -7,11 +7,13 @@ import signal
 import random
 import hashlib
 import threading
+import urllib.robotparser
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 from collections import deque, defaultdict
 
 import requests
+import trafilatura
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -34,10 +36,18 @@ FLUSH_EVERY_N_RECORDS = 25
 SAVE_STATE_EVERY_N_PAGES = 50
 SLEEP_RANGE_SECONDS = (0.2, 0.8)
 
-MAX_TEXT_CHARS = 5000
+MAX_CONTENT_CHARS = 50000   # full cleaned body text stored in the output
+MAX_TEXT_CHARS = 5000       # kept for legacy relevance-scoring window
 MAX_LINKS_PER_PAGE = 200
 MAX_PAGES_PER_DOMAIN = 120
 MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN = 35
+MIN_CONTENT_LENGTH = 200    # skip stub / redirect / error pages
+
+# Code-block extraction limits (for the code_blocks field)
+MAX_CODE_BLOCKS = 20
+MAX_CODE_BLOCK_CHARS = 2000
+
+ROBOTS_CACHE_TTL = 3600     # seconds to cache robots.txt per domain
 
 # Search engines and major aggregators to exclude (avoid crawling them like a search engine)
 BLOCKED_DOMAINS = {
@@ -52,13 +62,46 @@ BLOCKED_DOMAINS = {
 
 # Cybersecurity relevance keywords used for scoring
 CYBER_KEYWORDS = [
+    # CVE / vulnerability basics
     "cve-", "vulnerability", "vulnerabilities", "exploit", "exploited",
     "advisory", "security advisory", "security update", "patch",
+    # Malware / threat categories
     "ransomware", "malware", "phishing", "botnet", "threat actor",
+    "rootkit", "backdoor", "trojan", "worm", "spyware", "adware", "dropper",
+    # Threat intel
     "ioc", "indicator of compromise", "zero-day", "0day", "cvss",
+    "apt", "threat intelligence", "ttp", "tactics techniques procedures",
+    "incident response", "iocs", "yara", "sigma", "snort",
+    # Standards / frameworks
+    "cybersecurity", "infosec", "mitre", "nist", "kev",
+    "mitre att&ck", "capec", "cwe", "owasp",
+    # Web / injection attacks
     "remote code execution", "rce", "privilege escalation", "xss",
-    "sql injection", "supply chain", "firmware", "kev", "mitre", "nist",
-    "cybersecurity", "infosec", "apt", "incident response",
+    "sql injection", "command injection", "path traversal",
+    "directory traversal", "ssrf", "csrf", "xxe", "idor",
+    "deserialization", "nosql injection", "ldap injection",
+    "open redirect", "template injection", "server-side template",
+    # Memory corruption
+    "buffer overflow", "heap spray", "use-after-free",
+    "memory corruption", "stack overflow", "integer overflow",
+    "format string", "type confusion",
+    # Network / infrastructure attacks
+    "supply chain", "firmware", "lateral movement",
+    "c2", "command and control", "network pivot", "pivoting",
+    "port scan", "network scan", "nmap",
+    # Auth attacks
+    "brute force", "credential stuffing", "password spray",
+    "authentication bypass", "authorization bypass",
+    "token hijacking", "session fixation", "replay attack",
+    # Tools / tradecraft
+    "shellcode", "payload", "metasploit", "burpsuite", "wireshark",
+    "cobalt strike", "empire", "msfvenom", "netcat", "mimikatz",
+    "hydra", "hashcat", "john the ripper", "aircrack",
+    # Research / education
+    "penetration test", "pentest", "red team", "blue team", "purple team",
+    "ctf", "capture the flag", "writeup", "proof of concept", "poc",
+    "reverse engineering", "binary analysis", "fuzzing", "afl",
+    "static analysis", "dynamic analysis", "sandbox",
 ]
 
 # Fallback seeds used only if seeds.txt is missing
@@ -88,6 +131,10 @@ domain_lowrel_streak = defaultdict(int)
 records_buffer = []
 pages_processed = 0
 rows_saved = 0
+
+# robots.txt: domain -> (RobotFileParser, expiry_timestamp)
+robots_cache: dict = {}
+robots_lock = threading.Lock()
 
 
 # =========================
@@ -175,7 +222,29 @@ def extract_cves(title: str, text: str):
     return sorted(set(m.upper() for m in re.findall(r"\bcve-\d{4}-\d{4,7}\b", blob)))
 
 
-def extract_text_and_title(html: str):
+def extract_code_blocks(soup: BeautifulSoup) -> list:
+    """Return a deduplicated list of code snippets from <pre> and <code> tags."""
+    blocks = []
+    seen_hashes: set = set()
+    for tag in soup.find_all(["pre", "code"]):
+        code = tag.get_text(" ", strip=True)
+        code = re.sub(r"\s+", " ", code).strip()
+        if len(code) < 10:
+            continue
+        # Deduplicate — nested <pre><code> pairs produce the same text twice
+        h = hashlib.sha256(code[:200].encode("utf-8", errors="ignore")).hexdigest()
+        if h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        if len(code) > MAX_CODE_BLOCK_CHARS:
+            code = code[:MAX_CODE_BLOCK_CHARS]
+        blocks.append(code)
+        if len(blocks) >= MAX_CODE_BLOCKS:
+            break
+    return blocks
+
+
+def extract_text_and_title(html: str, url: str = ""):
     soup = BeautifulSoup(html, "html.parser")
     for t in soup(["script", "style", "noscript", "svg"]):
         t.decompose()
@@ -188,12 +257,54 @@ def extract_text_and_title(html: str):
         if h1:
             title = h1.get_text(" ", strip=True)
 
-    text = soup.get_text(" ", strip=True)
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > MAX_TEXT_CHARS:
-        text = text[:MAX_TEXT_CHARS]
+    # Extract code blocks before trafilatura drops them
+    code_blocks = extract_code_blocks(soup)
 
-    return soup, title, text
+    # trafilatura extracts the main article body, stripping nav/sidebar/footer/ads.
+    # This produces far cleaner text for ML training than soup.get_text().
+    text = trafilatura.extract(
+        html,
+        url=url or None,
+        include_comments=False,
+        include_tables=True,
+        no_fallback=False,
+        favor_precision=False,
+    )
+    if not text:
+        # Fallback: use BeautifulSoup full-page text
+        text = soup.get_text(" ", strip=True)
+
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > MAX_CONTENT_CHARS:
+        text = text[:MAX_CONTENT_CHARS]
+
+    return soup, title, text, code_blocks
+
+
+def robots_allowed(session: requests.Session, url: str) -> bool:
+    """Return True if USER_AGENT is permitted to fetch *url* per the site's robots.txt."""
+    parsed = urlparse(url)
+    h = parsed.netloc.lower()
+    robots_url = f"{parsed.scheme}://{h}/robots.txt"
+
+    with robots_lock:
+        entry = robots_cache.get(h)
+        now = time.time()
+        if entry and now < entry[1]:
+            rp = entry[0]
+        else:
+            rp = urllib.robotparser.RobotFileParser()
+            rp.set_url(robots_url)
+            try:
+                resp = session.get(robots_url, timeout=10, allow_redirects=True)
+                if resp.status_code == 200:
+                    rp.parse(resp.text.splitlines())
+                # 404 / other -> treat as no restrictions (rp stays unparsed -> can_fetch returns True)
+            except Exception:
+                pass
+            robots_cache[h] = (rp, now + ROBOTS_CACHE_TTL)
+
+    return rp.can_fetch(USER_AGENT, url)
 
 
 def enqueue(url: str, priority=False):
@@ -345,7 +456,11 @@ def should_prioritize_link(link: str) -> bool:
     return any(m in l for m in priority_markers)
 
 
-def record_if_relevant(url: str, title: str, text: str):
+def record_if_relevant(url: str, title: str, text: str, code_blocks: list):
+    # Skip pages with almost no content (login redirects, 404s, etc.)
+    if len(text) < MIN_CONTENT_LENGTH:
+        return
+
     score = relevance_score(title, text)
 
     h = host(url)
@@ -355,10 +470,13 @@ def record_if_relevant(url: str, title: str, text: str):
     domain_lowrel_streak[h] = 0
 
     cves = extract_cves(title, text)
-    rid = text_hash(url, title, text[:800])
-    if rid in seen_records:
+
+    # Content-based dedup so the same article republished on multiple URLs
+    # is only stored once.
+    content_hash = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+    if content_hash in seen_records:
         return
-    seen_records.add(rid)
+    seen_records.add(content_hash)
 
     record = {
         "scraped_at_utc": now_iso(),
@@ -367,7 +485,10 @@ def record_if_relevant(url: str, title: str, text: str):
         "title": title,
         "relevance_score": score,
         "cves_found": cves,
+        "content_hash": content_hash,
+        "content": text,
         "content_snippet": text[:1200],
+        "code_blocks": code_blocks,
     }
     records_buffer.append(record)
 
@@ -407,6 +528,9 @@ def crawl(seeds):
         domain_page_count[h] += 1
 
         try:
+            if not robots_allowed(session, url):
+                continue
+
             r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             final_url = normalize_url(r.url)
 
@@ -417,8 +541,8 @@ def crawl(seeds):
             if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
                 continue
 
-            soup, title, text = extract_text_and_title(r.text)
-            record_if_relevant(final_url, title, text)
+            soup, title, text, code_blocks = extract_text_and_title(r.text, url=final_url)
+            record_if_relevant(final_url, title, text, code_blocks)
 
             links = extract_links(final_url, soup)
 
