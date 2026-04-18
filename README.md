@@ -172,8 +172,16 @@ You can override at runtime without editing code:
 ```powershell
 $env:OSIRIS_THREADS = "128"
 $env:OSIRIS_CONN_POOL = "1024"
+$env:OSIRIS_MAX_PAGES_TOTAL = "3000000"
+$env:OSIRIS_MAX_QUEUE_SIZE = "3000000"
 $env:OSIRIS_SLEEP_MIN_MS = "0"
 $env:OSIRIS_SLEEP_MAX_MS = "2"
+python cyber_wide_crawler.py
+```
+
+```bash
+export OSIRIS_MAX_PAGES_TOTAL=3000000
+export OSIRIS_MAX_QUEUE_SIZE=3000000
 python cyber_wide_crawler.py
 ```
 

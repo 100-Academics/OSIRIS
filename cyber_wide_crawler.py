@@ -57,6 +57,8 @@ ENV_CONN_POOL = "OSIRIS_CONN_POOL"
 ENV_SLEEP_MIN_MS = "OSIRIS_SLEEP_MIN_MS"
 ENV_SLEEP_MAX_MS = "OSIRIS_SLEEP_MAX_MS"
 ENV_RUNTIME_CONFIG = "OSIRIS_RUNTIME_CONFIG_FILE"
+ENV_MAX_PAGES_TOTAL = "OSIRIS_MAX_PAGES_TOTAL"
+ENV_MAX_QUEUE_SIZE = "OSIRIS_MAX_QUEUE_SIZE"
 
 RUNTIME_SPEED_AUTO = "auto"
 RUNTIME_SPEED_MAX = "max"
@@ -244,6 +246,16 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+def _env_int(name: str, default: int, low: int = 1, high: int = 1_000_000_000) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return default
+        return _clamp(int(raw), low, high)
+    except (TypeError, ValueError):
+        return default
+
+
 def _log_state_warning(message: str):
     now = time.time()
     with state_warning_lock:
@@ -388,6 +400,18 @@ def auto_tune_runtime(runtime_config: dict = None):
     CRAWLER_THREADS = tuned_threads
     CONNECTION_POOL_SIZE = tuned_pool
     SLEEP_RANGE_SECONDS = tuned_sleep
+
+
+def apply_runtime_page_limit():
+    """Allow the total crawl cap to be overridden at startup."""
+    global MAX_PAGES_TOTAL
+    MAX_PAGES_TOTAL = _env_int(ENV_MAX_PAGES_TOTAL, MAX_PAGES_TOTAL)
+
+
+def apply_runtime_queue_limit():
+    """Allow the in-memory queue cap to be overridden at startup."""
+    global MAX_QUEUE_SIZE
+    MAX_QUEUE_SIZE = _env_int(ENV_MAX_QUEUE_SIZE, MAX_QUEUE_SIZE)
 
 
 def now_iso():
@@ -973,6 +997,8 @@ def main():
     runtime_cfg_path = runtime_config_path()
     runtime_cfg, was_created = load_or_create_runtime_config(runtime_cfg_path)
     auto_tune_runtime(runtime_cfg)
+    apply_runtime_page_limit()
+    apply_runtime_queue_limit()
 
     print("[start] OSIRIS — Open Security Intelligence Recursive Internet Scraper")
     print("[start] Dynamic domain discovery enabled. Search engines excluded.")
@@ -985,7 +1011,8 @@ def main():
     )
     print(
         f"[start] Runtime tuning: threads={CRAWLER_THREADS} "
-        f"connection_pool={CONNECTION_POOL_SIZE} sleep_range={SLEEP_RANGE_SECONDS}"
+        f"connection_pool={CONNECTION_POOL_SIZE} sleep_range={SLEEP_RANGE_SECONDS} "
+        f"max_pages={MAX_PAGES_TOTAL} max_queue={MAX_QUEUE_SIZE}"
     )
     print("[start] Press Ctrl+C anytime for safe save and exit.")
 

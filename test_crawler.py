@@ -371,6 +371,64 @@ class TestRuntimeSpeedConfig(unittest.TestCase):
         self.assertAlmostEqual(cwc.SLEEP_RANGE_SECONDS[1], 0.003)
 
 
+class TestPageLimitConfig(unittest.TestCase):
+
+    def setUp(self):
+        self._orig_limit = cwc.MAX_PAGES_TOTAL
+        self._orig_env = os.environ.get(cwc.ENV_MAX_PAGES_TOTAL)
+
+    def tearDown(self):
+        cwc.MAX_PAGES_TOTAL = self._orig_limit
+        if self._orig_env is None:
+            os.environ.pop(cwc.ENV_MAX_PAGES_TOTAL, None)
+        else:
+            os.environ[cwc.ENV_MAX_PAGES_TOTAL] = self._orig_env
+
+    def test_page_limit_can_be_overridden_via_env(self):
+        os.environ[cwc.ENV_MAX_PAGES_TOTAL] = "3000000"
+        cwc.apply_runtime_page_limit()
+        self.assertEqual(cwc.MAX_PAGES_TOTAL, 3000000)
+
+    def test_invalid_page_limit_falls_back_to_default(self):
+        os.environ[cwc.ENV_MAX_PAGES_TOTAL] = "not-a-number"
+        cwc.apply_runtime_page_limit()
+        self.assertEqual(cwc.MAX_PAGES_TOTAL, self._orig_limit)
+
+
+class TestQueueLimitConfig(unittest.TestCase):
+
+    def setUp(self):
+        self._orig_limit = cwc.MAX_QUEUE_SIZE
+        self._orig_env = os.environ.get(cwc.ENV_MAX_QUEUE_SIZE)
+        _clear_global_state()
+
+    def tearDown(self):
+        cwc.MAX_QUEUE_SIZE = self._orig_limit
+        if self._orig_env is None:
+            os.environ.pop(cwc.ENV_MAX_QUEUE_SIZE, None)
+        else:
+            os.environ[cwc.ENV_MAX_QUEUE_SIZE] = self._orig_env
+        _clear_global_state()
+
+    def test_queue_limit_can_be_overridden_via_env(self):
+        os.environ[cwc.ENV_MAX_QUEUE_SIZE] = "3000000"
+        cwc.apply_runtime_queue_limit()
+        self.assertEqual(cwc.MAX_QUEUE_SIZE, 3000000)
+
+    def test_invalid_queue_limit_falls_back_to_default(self):
+        os.environ[cwc.ENV_MAX_QUEUE_SIZE] = "not-a-number"
+        cwc.apply_runtime_queue_limit()
+        self.assertEqual(cwc.MAX_QUEUE_SIZE, self._orig_limit)
+
+    def test_enqueue_respects_queue_cap(self):
+        cwc.MAX_QUEUE_SIZE = 2
+        cwc.enqueue("https://example.com/one")
+        cwc.enqueue("https://example.com/two")
+        cwc.enqueue("https://example.com/three")
+        self.assertEqual(len(cwc.queued_set), 2)
+        self.assertNotIn("https://example.com/three", cwc.queued_set)
+
+
 # ---------------------------------------------------------------------------
 # record_if_relevant + flush_records → valid JSONL
 # ---------------------------------------------------------------------------
