@@ -131,15 +131,53 @@ Key settings at the top of `cyber_wide_crawler.py`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `MAX_PAGES_TOTAL` | 20000 | Stop after this many pages |
-| `MAX_PAGES_PER_DOMAIN` | 120 | Max pages crawled per domain |
+| `MAX_PAGES_TOTAL` | 200000 | Stop after this many pages |
+| `MAX_PAGES_PER_DOMAIN` | 320 | Max pages crawled per domain |
 | `MAX_QUEUE_SIZE` | 120000 | Max URLs held in memory queue |
 | `AUTOSAVE_SECONDS` | 20 | How often to flush and save state |
-| `SLEEP_RANGE_SECONDS` | (0.2, 0.8) | Random delay between requests |
+| `SLEEP_RANGE_SECONDS` | Auto-tuned | Random delay between requests |
 | `MAX_CONTENT_CHARS` | 50000 | Max chars of cleaned body text stored per page |
 | `MIN_CONTENT_LENGTH` | 200 | Skip pages with fewer than this many content characters |
-| `MAX_CODE_BLOCKS` | 20 | Max code snippets extracted per page |
+| `MAX_CODE_BLOCKS` | 100 | Max code snippets extracted per page |
 | `ROBOTS_CACHE_TTL` | 3600 | Seconds to cache a domain's robots.txt |
+
+Throughput defaults are now auto-tuned at startup for network-bound crawling:
+- threads: `cpu_count * 8` (clamped to `32..128`)
+- connection pool: `threads * 4` (clamped to `128..1024`)
+- short per-request jitter for politeness (also auto-tuned)
+
+On first run, OSIRIS creates `crawler_runtime_config.json` (machine-local speed profile file).
+Edit this once and it will be used on every run.
+
+```json
+{
+  "version": 1,
+  "speed_profile": "auto",
+  "custom": {
+    "threads": null,
+    "connection_pool": null,
+    "sleep_min_ms": null,
+    "sleep_max_ms": null
+  }
+}
+```
+
+`speed_profile` values:
+- `auto` -> auto-tuned per machine (default)
+- `max` -> aggressive max-speed tuning for that machine
+- `custom` -> uses values from `custom`
+
+You can override at runtime without editing code:
+
+```powershell
+$env:OSIRIS_THREADS = "128"
+$env:OSIRIS_CONN_POOL = "1024"
+$env:OSIRIS_SLEEP_MIN_MS = "0"
+$env:OSIRIS_SLEEP_MAX_MS = "2"
+python cyber_wide_crawler.py
+```
+
+If you want to keep one profile per machine and never type env vars, set `speed_profile` in `crawler_runtime_config.json` and run normally.
 
 ---
 
@@ -201,6 +239,24 @@ python -m pytest test_crawler.py -v
 ```
 
 The test suite covers relevance scoring, CVE extraction, HTML parsing, link filtering, the JSONL write/read round-trip, content deduplication, and state save/load — without making any real network requests.
+
+## Running benchmarks
+
+`test_benchmark.py` provides opt-in micro-benchmarks for crawler hot paths:
+- `extract_text_and_title`
+- `relevance_score`
+- `record_if_relevant` + `flush_records`
+
+PowerShell:
+
+```powershell
+$env:OSIRIS_RUN_BENCH = "1"
+python -m unittest -v test_benchmark.py
+Remove-Item Env:OSIRIS_RUN_BENCH
+```
+
+The benchmark tests print average latency, median latency, best latency, and operations/second for each benchmark case.
+They run in a temporary sandbox and redirect writes away from the default `cyber_wide_data.jsonl` and `crawler_state.json` files.
 
 ---
 

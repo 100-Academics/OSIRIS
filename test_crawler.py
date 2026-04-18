@@ -21,6 +21,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import cyber_wide_crawler as cwc
 
@@ -45,6 +46,11 @@ def _clear_global_state():
     cwc.records_buffer.clear()
     cwc.pages_processed = 0
     cwc.rows_saved = 0
+    cwc.flush_count = 0
+    cwc.shutdown_started = False
+    cwc.final_state_saved = False
+    cwc.last_state_warning["message"] = ""
+    cwc.last_state_warning["at"] = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +319,59 @@ class TestShouldPrioritizeLink(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Runtime speed config (first-run file + profiles)
+# ---------------------------------------------------------------------------
+
+class TestRuntimeSpeedConfig(unittest.TestCase):
+
+    def setUp(self):
+        self._orig_threads = cwc.CRAWLER_THREADS
+        self._orig_pool = cwc.CONNECTION_POOL_SIZE
+        self._orig_sleep = cwc.SLEEP_RANGE_SECONDS
+        self._tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        cwc.CRAWLER_THREADS = self._orig_threads
+        cwc.CONNECTION_POOL_SIZE = self._orig_pool
+        cwc.SLEEP_RANGE_SECONDS = self._orig_sleep
+
+    def test_runtime_config_created_on_first_run(self):
+        path = os.path.join(self._tmpdir, "runtime_config.json")
+        cfg, created = cwc.load_or_create_runtime_config(path)
+        self.assertTrue(created)
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(cfg["speed_profile"], cwc.RUNTIME_SPEED_AUTO)
+
+    def test_max_profile_is_more_aggressive_than_auto(self):
+        cwc.auto_tune_runtime({"speed_profile": cwc.RUNTIME_SPEED_AUTO})
+        auto_threads = cwc.CRAWLER_THREADS
+        auto_pool = cwc.CONNECTION_POOL_SIZE
+        auto_sleep = cwc.SLEEP_RANGE_SECONDS
+
+        cwc.auto_tune_runtime({"speed_profile": cwc.RUNTIME_SPEED_MAX})
+        self.assertGreaterEqual(cwc.CRAWLER_THREADS, auto_threads)
+        self.assertGreaterEqual(cwc.CONNECTION_POOL_SIZE, auto_pool)
+        self.assertLessEqual(cwc.SLEEP_RANGE_SECONDS[1], auto_sleep[1])
+
+    def test_custom_profile_respects_values(self):
+        cwc.auto_tune_runtime(
+            {
+                "speed_profile": cwc.RUNTIME_SPEED_CUSTOM,
+                "custom": {
+                    "threads": 21,
+                    "connection_pool": 333,
+                    "sleep_min_ms": 1.0,
+                    "sleep_max_ms": 3.0,
+                },
+            }
+        )
+        self.assertEqual(cwc.CRAWLER_THREADS, 21)
+        self.assertEqual(cwc.CONNECTION_POOL_SIZE, 333)
+        self.assertAlmostEqual(cwc.SLEEP_RANGE_SECONDS[0], 0.001)
+        self.assertAlmostEqual(cwc.SLEEP_RANGE_SECONDS[1], 0.003)
+
+
+# ---------------------------------------------------------------------------
 # record_if_relevant + flush_records → valid JSONL
 # ---------------------------------------------------------------------------
 
@@ -563,6 +622,57 @@ class TestStatePersistence(unittest.TestCase):
             f.write("{ not valid json !!!")
         self.assertFalse(cwc.load_state())
 
+    def test_load_state_recovers_from_tmp_when_main_is_corrupt(self):
+        with open(cwc.STATE_FILE, "w", encoding="utf-8") as f:
+            f.write("{ broken")
+        with open(cwc.STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({
+                "queue": ["https://example.com/recovered"],
+                "queued_set": [],
+                "visited": [],
+                "seen_records": [],
+                "domain_page_count": {},
+                "domain_lowrel_streak": {},
+                "pages_processed": 123,
+                "rows_saved": 9,
+            }, f)
+
+        self.assertTrue(cwc.load_state())
+        self.assertIn("https://example.com/recovered", cwc.queue)
+        self.assertEqual(cwc.pages_processed, 123)
+
+    def test_load_state_prefers_newer_tmp_when_both_valid(self):
+        with open(cwc.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "queue": ["https://example.com/old"],
+                "queued_set": [],
+                "visited": [],
+                "seen_records": [],
+                "domain_page_count": {},
+                "domain_lowrel_streak": {},
+                "pages_processed": 10,
+                "rows_saved": 1,
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }, f)
+
+        with open(cwc.STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({
+                "queue": ["https://example.com/new"],
+                "queued_set": [],
+                "visited": [],
+                "seen_records": [],
+                "domain_page_count": {},
+                "domain_lowrel_streak": {},
+                "pages_processed": 20,
+                "rows_saved": 2,
+                "timestamp": "2026-01-01T00:00:01+00:00",
+            }, f)
+
+        self.assertTrue(cwc.load_state())
+        self.assertIn("https://example.com/new", cwc.queue)
+        self.assertNotIn("https://example.com/old", cwc.queue)
+        self.assertEqual(cwc.pages_processed, 20)
+
     def test_state_written_atomically(self):
         """State is written to a .tmp file then renamed — the final file must be complete."""
         cwc.pages_processed = 99
@@ -573,6 +683,39 @@ class TestStatePersistence(unittest.TestCase):
         with open(cwc.STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
         self.assertEqual(state["pages_processed"], 99)
+
+    def test_permission_error_on_replace_keeps_previous_state(self):
+        cwc.pages_processed = 1
+        cwc.queue.append("https://example.com/old")
+        self.assertTrue(cwc.save_state())
+
+        cwc.pages_processed = 2
+        cwc.queue.append("https://example.com/new")
+
+        with patch("cyber_wide_crawler.time.sleep", return_value=None):
+            with patch("cyber_wide_crawler.os.replace", side_effect=PermissionError("locked")):
+                self.assertFalse(cwc.save_state(sync=False))
+
+        # Existing on-disk state remains valid and unchanged.
+        with open(cwc.STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertEqual(state["pages_processed"], 1)
+        self.assertIn("https://example.com/old", state["queue"])
+        self.assertNotIn("https://example.com/new", state["queue"])
+
+        # In-memory queue/state is preserved; failure does not clear progress.
+        self.assertEqual(cwc.pages_processed, 2)
+        self.assertIn("https://example.com/new", cwc.queue)
+
+    def test_graceful_shutdown_is_idempotent(self):
+        _clear_global_state()
+        with patch("cyber_wide_crawler.flush_records") as mock_flush:
+            with patch("cyber_wide_crawler.save_state", return_value=True) as mock_save:
+                cwc.graceful_shutdown()
+                cwc.graceful_shutdown()
+
+        self.assertEqual(mock_flush.call_count, 1)
+        self.assertEqual(mock_save.call_count, 1)
 
 
 # ---------------------------------------------------------------------------

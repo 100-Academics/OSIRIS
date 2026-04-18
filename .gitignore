@@ -6,6 +6,10 @@ cyber_wide_data.csv
 crawler_state.json
 crawler_state.json.tmp
 
+# Machine-local runtime tuning profile
+crawler_runtime_config.json
+crawler_runtime_config.json.tmp
+
 # Python virtual environments
 venv/
 .venv/

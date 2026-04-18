@@ -19,11 +19,17 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+try:
+    import orjson
+except ImportError:
+    orjson = None
+
 # =========================
 # CONFIG
 # =========================
 OUTPUT_FILE = "cyber_wide_data.jsonl"
 STATE_FILE = "crawler_state.json"
+RUNTIME_CONFIG_FILE = "crawler_runtime_config.json"
 SEEDS_FILE = "seeds.txt"
 
 USER_AGENT = "CyberWideCrawler/1.0 (public research crawler; +https://github.com/100-Academics/OSIRIS)"
@@ -35,10 +41,27 @@ CRAWLER_THREADS = 16
 CONNECTION_POOL_SIZE = 200
 
 AUTOSAVE_SECONDS = 20
-FLUSH_EVERY_N_RECORDS = 25
-SAVE_STATE_EVERY_N_PAGES = 50
+FLUSH_EVERY_N_RECORDS = 100
+SAVE_STATE_EVERY_N_PAGES = 250
 SLEEP_RANGE_SECONDS = (0.02, 0.08)
-OUTPUT_FSYNC_EVERY_N_FLUSHES = 5
+OUTPUT_FSYNC_EVERY_N_FLUSHES = 20
+STATE_REPLACE_RETRIES_FAST = 8
+STATE_REPLACE_RETRY_SECONDS_FAST = 0.05
+STATE_REPLACE_RETRIES_SYNC = 80
+STATE_REPLACE_RETRY_SECONDS_SYNC = 0.1
+STATE_WARNING_THROTTLE_SECONDS = 5.0
+
+# Environment overrides for runtime tuning
+ENV_THREADS = "OSIRIS_THREADS"
+ENV_CONN_POOL = "OSIRIS_CONN_POOL"
+ENV_SLEEP_MIN_MS = "OSIRIS_SLEEP_MIN_MS"
+ENV_SLEEP_MAX_MS = "OSIRIS_SLEEP_MAX_MS"
+ENV_RUNTIME_CONFIG = "OSIRIS_RUNTIME_CONFIG_FILE"
+
+RUNTIME_SPEED_AUTO = "auto"
+RUNTIME_SPEED_MAX = "max"
+RUNTIME_SPEED_CUSTOM = "custom"
+RUNTIME_SPEED_VALUES = {RUNTIME_SPEED_AUTO, RUNTIME_SPEED_MAX, RUNTIME_SPEED_CUSTOM}
 
 MAX_CONTENT_CHARS = 50000   # full cleaned body text stored in the output
 MAX_LINKS_PER_PAGE = 200
@@ -185,6 +208,8 @@ DEFAULT_SEEDS = [
 # =========================
 stop_event = threading.Event()
 save_lock = threading.Lock()
+state_warning_lock = threading.Lock()
+shutdown_once_lock = threading.Lock()
 
 queue = deque()
 queued_set = set()
@@ -199,9 +224,14 @@ pages_processed = 0
 rows_saved = 0
 flush_count = 0
 
+shutdown_started = False
+final_state_saved = False
+last_state_warning = {"message": "", "at": 0.0}
+
 # robots.txt: domain -> (RobotFileParser, expiry_timestamp)
 robots_cache: dict = {}
 robots_lock = threading.Lock()
+robots_inflight: dict = {}
 
 # Per-thread HTTP session so workers reuse keep-alive connections safely.
 thread_local = threading.local()
@@ -214,21 +244,146 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
-def auto_tune_runtime():
+def _log_state_warning(message: str):
+    now = time.time()
+    with state_warning_lock:
+        same_message = message == last_state_warning["message"]
+        if same_message and (now - last_state_warning["at"]) < STATE_WARNING_THROTTLE_SECONDS:
+            return
+        last_state_warning["message"] = message
+        last_state_warning["at"] = now
+    print(message, file=sys.stderr)
+
+
+def runtime_config_path() -> str:
+    return os.getenv(ENV_RUNTIME_CONFIG, RUNTIME_CONFIG_FILE)
+
+
+def _default_runtime_config() -> dict:
+    return {
+        "version": 1,
+        "speed_profile": RUNTIME_SPEED_AUTO,
+        "custom": {
+            "threads": None,
+            "connection_pool": None,
+            "sleep_min_ms": None,
+            "sleep_max_ms": None,
+        },
+        "created_at": now_iso(),
+    }
+
+
+def _validate_runtime_config(raw: dict) -> dict:
+    cfg = _default_runtime_config()
+    if not isinstance(raw, dict):
+        return cfg
+
+    profile = str(raw.get("speed_profile", RUNTIME_SPEED_AUTO)).strip().lower()
+    if profile not in RUNTIME_SPEED_VALUES:
+        profile = RUNTIME_SPEED_AUTO
+    cfg["speed_profile"] = profile
+
+    custom = raw.get("custom") if isinstance(raw.get("custom"), dict) else {}
+    out_custom = cfg["custom"]
+    for key in ("threads", "connection_pool"):
+        val = custom.get(key)
+        if isinstance(val, int) and val > 0:
+            out_custom[key] = val
+    for key in ("sleep_min_ms", "sleep_max_ms"):
+        val = custom.get(key)
+        if isinstance(val, (int, float)) and val >= 0:
+            out_custom[key] = float(val)
+    return cfg
+
+
+def load_or_create_runtime_config(path: str = None) -> tuple[dict, bool]:
+    cfg_path = path or runtime_config_path()
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                return _validate_runtime_config(json.load(f)), False
+        except Exception:
+            # If config is corrupted, recreate it with safe defaults.
+            pass
+
+    cfg = _default_runtime_config()
+    tmp = cfg_path + ".tmp"
+    if orjson is not None:
+        with open(tmp, "wb") as f:
+            f.write(orjson.dumps(cfg, option=orjson.OPT_INDENT_2))
+            f.flush()
+            os.fsync(f.fileno())
+    else:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+    os.replace(tmp, cfg_path)
+    return cfg, True
+
+
+def auto_tune_runtime(runtime_config: dict = None):
     """Tune runtime concurrency knobs for this machine on every start."""
     global CRAWLER_THREADS, CONNECTION_POOL_SIZE, SLEEP_RANGE_SECONDS
 
     cpu_count = os.cpu_count() or 4
-    tuned_threads = _clamp(cpu_count * 2, 8, 32)
-    tuned_pool = _clamp(tuned_threads * 8, 64, 256)
+    # This crawler is mostly network-bound, so higher concurrency than CPU count helps.
+    tuned_threads = _clamp(cpu_count * 8, 32, 128)
+    tuned_pool = _clamp(tuned_threads * 4, 128, 1024)
 
-    # Slightly lower per-request delay at higher concurrency while preserving politeness.
-    if tuned_threads >= 24:
-        tuned_sleep = (0.01, 0.05)
-    elif tuned_threads >= 16:
-        tuned_sleep = (0.015, 0.06)
+    if tuned_threads >= 96:
+        tuned_sleep = (0.0, 0.004)
+    elif tuned_threads >= 64:
+        tuned_sleep = (0.0, 0.008)
     else:
-        tuned_sleep = (0.02, 0.08)
+        tuned_sleep = (0.002, 0.012)
+
+    cfg = _validate_runtime_config(runtime_config or {})
+    profile = cfg["speed_profile"]
+
+    if profile == RUNTIME_SPEED_MAX:
+        tuned_threads = _clamp(cpu_count * 16, 64, 256)
+        tuned_pool = _clamp(tuned_threads * 4, 256, 2048)
+        tuned_sleep = (0.0, 0.001)
+    elif profile == RUNTIME_SPEED_CUSTOM:
+        custom = cfg["custom"]
+        if custom["threads"] is not None:
+            tuned_threads = _clamp(int(custom["threads"]), 1, 512)
+        if custom["connection_pool"] is not None:
+            tuned_pool = _clamp(int(custom["connection_pool"]), 1, 2048)
+        if custom["sleep_min_ms"] is not None or custom["sleep_max_ms"] is not None:
+            lo = custom["sleep_min_ms"] if custom["sleep_min_ms"] is not None else (tuned_sleep[0] * 1000.0)
+            hi = custom["sleep_max_ms"] if custom["sleep_max_ms"] is not None else (tuned_sleep[1] * 1000.0)
+            lo = max(0.0, float(lo))
+            hi = max(lo, float(hi))
+            tuned_sleep = (lo / 1000.0, hi / 1000.0)
+
+    # Optional runtime overrides for operator control without code edits.
+    try:
+        threads_override = os.getenv(ENV_THREADS)
+        if threads_override:
+            tuned_threads = _clamp(int(threads_override), 1, 512)
+    except ValueError:
+        pass
+
+    try:
+        pool_override = os.getenv(ENV_CONN_POOL)
+        if pool_override:
+            tuned_pool = _clamp(int(pool_override), 1, 2048)
+    except ValueError:
+        pass
+
+    try:
+        sleep_min_ms = os.getenv(ENV_SLEEP_MIN_MS)
+        sleep_max_ms = os.getenv(ENV_SLEEP_MAX_MS)
+        if sleep_min_ms is not None or sleep_max_ms is not None:
+            lo = float(sleep_min_ms) if sleep_min_ms is not None else (tuned_sleep[0] * 1000.0)
+            hi = float(sleep_max_ms) if sleep_max_ms is not None else (tuned_sleep[1] * 1000.0)
+            lo = max(0.0, lo)
+            hi = max(lo, hi)
+            tuned_sleep = (lo / 1000.0, hi / 1000.0)
+    except ValueError:
+        pass
 
     CRAWLER_THREADS = tuned_threads
     CONNECTION_POOL_SIZE = tuned_pool
@@ -285,7 +440,7 @@ def setup_session() -> requests.Session:
         total=MAX_RETRIES,
         connect=MAX_RETRIES,
         read=MAX_RETRIES,
-        backoff_factor=0.7,
+        backoff_factor=0.25,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=frozenset(["GET", "HEAD"]),
         raise_on_status=False,
@@ -388,11 +543,29 @@ def robots_allowed(session: requests.Session, url: str) -> bool:
     robots_url = f"{parsed.scheme}://{h}/robots.txt"
 
     now = time.time()
+    do_fetch = False
+    waiter = None
+
     # Fast path: return cached result without doing any I/O.
     with robots_lock:
         entry = robots_cache.get(h)
         if entry and now < entry[1]:
             return entry[0].can_fetch(USER_AGENT, url)
+
+        waiter = robots_inflight.get(h)
+        if waiter is None:
+            waiter = threading.Event()
+            robots_inflight[h] = waiter
+            do_fetch = True
+
+    if not do_fetch:
+        # Another thread is fetching this domain's robots.txt right now.
+        waiter.wait(timeout=3)
+        with robots_lock:
+            entry = robots_cache.get(h)
+            if entry and time.time() < entry[1]:
+                return entry[0].can_fetch(USER_AGENT, url)
+        return True
 
     # Cache miss — fetch robots.txt *outside* the lock so other threads are not blocked.
     rp = urllib.robotparser.RobotFileParser()
@@ -413,6 +586,9 @@ def robots_allowed(session: requests.Session, url: str) -> bool:
             robots_cache[h] = (rp, time.time() + ROBOTS_CACHE_TTL)
         else:
             rp = entry[0]
+        in_flight = robots_inflight.pop(h, None)
+        if in_flight is not None:
+            in_flight.set()
 
     return rp.can_fetch(USER_AGENT, url)
 
@@ -473,14 +649,25 @@ def flush_records():
         rows_saved += len(to_write)
         flush_count += 1
         should_fsync = (flush_count % OUTPUT_FSYNC_EVERY_N_FLUSHES) == 0
-    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-        f.write("\n".join(json.dumps(r, ensure_ascii=False) for r in to_write) + "\n")
-        f.flush()
-        if should_fsync:
-            os.fsync(f.fileno())
+    if orjson is not None:
+        payload = b"".join(orjson.dumps(r) + b"\n" for r in to_write)
+        with open(OUTPUT_FILE, "ab") as f:
+            f.write(payload)
+            f.flush()
+            if should_fsync:
+                os.fsync(f.fileno())
+    else:
+        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+            f.write("\n".join(json.dumps(r, ensure_ascii=False) for r in to_write) + "\n")
+            f.flush()
+            if should_fsync:
+                os.fsync(f.fileno())
 
 
-def save_state():
+def save_state(sync: bool = True) -> bool:
+    if stop_event.is_set() and not sync:
+        return False
+
     with save_lock:
         state = {
             "queue": list(queue),
@@ -494,36 +681,88 @@ def save_state():
             "timestamp": now_iso(),
         }
         tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, STATE_FILE)
+        if orjson is not None:
+            with open(tmp, "wb") as f:
+                f.write(orjson.dumps(state))
+                if sync:
+                    f.flush()
+                    os.fsync(f.fileno())
+        else:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+                if sync:
+                    f.flush()
+                    os.fsync(f.fileno())
+
+        retries = STATE_REPLACE_RETRIES_SYNC if sync else STATE_REPLACE_RETRIES_FAST
+        retry_seconds = STATE_REPLACE_RETRY_SECONDS_SYNC if sync else STATE_REPLACE_RETRY_SECONDS_FAST
+
+        for attempt in range(retries + 1):
+            try:
+                os.replace(tmp, STATE_FILE)
+                return True
+            except PermissionError as exc:
+                # Windows can transiently lock files (AV/indexing/backup); retry briefly.
+                if attempt >= retries:
+                    _log_state_warning(
+                        f"[state] warning: failed to replace {tmp} -> {STATE_FILE}: {exc}"
+                    )
+                    return False
+                time.sleep(retry_seconds)
+            except Exception as exc:
+                _log_state_warning(
+                    f"[state] warning: failed to save state {STATE_FILE}: {exc}"
+                )
+                return False
 
 
 def load_state():
     global pages_processed, rows_saved
-    if not os.path.exists(STATE_FILE):
+    candidates = [STATE_FILE, STATE_FILE + ".tmp"]
+    valid_states = []
+
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            ts = state.get("timestamp")
+            ts_epoch = 0.0
+            if isinstance(ts, str):
+                try:
+                    ts_epoch = datetime.fromisoformat(ts).timestamp()
+                except Exception:
+                    ts_epoch = 0.0
+            mtime = os.path.getmtime(path)
+            valid_states.append((ts_epoch, mtime, path, state))
+        except Exception:
+            continue
+
+    if not valid_states:
         return False
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
 
-        queue.extend(state.get("queue", []))
-        queued_set.update(state.get("queued_set", []))
-        visited.update(state.get("visited", []))
-        seen_records.update(state.get("seen_records", []))
+    # Prefer freshest valid state; if equal, prefer main STATE_FILE for determinism.
+    valid_states.sort(key=lambda x: (x[0], x[1], 1 if x[2] == STATE_FILE else 0), reverse=True)
+    _, _, loaded_from, state = valid_states[0]
 
-        for k, v in state.get("domain_page_count", {}).items():
-            domain_page_count[k] = v
-        for k, v in state.get("domain_lowrel_streak", {}).items():
-            domain_lowrel_streak[k] = v
+    queue.extend(state.get("queue", []))
+    queued_set.update(state.get("queued_set", []))
+    visited.update(state.get("visited", []))
+    seen_records.update(state.get("seen_records", []))
 
-        pages_processed = int(state.get("pages_processed", 0))
-        rows_saved = int(state.get("rows_saved", 0))
-        return True
-    except Exception:
-        return False
+    for k, v in state.get("domain_page_count", {}).items():
+        domain_page_count[k] = v
+    for k, v in state.get("domain_lowrel_streak", {}).items():
+        domain_lowrel_streak[k] = v
+
+    pages_processed = int(state.get("pages_processed", 0))
+    rows_saved = int(state.get("rows_saved", 0))
+
+    if loaded_from != STATE_FILE:
+        print(f"[resume] recovered state from {loaded_from}")
+    return True
 
 
 def load_seeds_from_file(path: str = SEEDS_FILE):
@@ -542,19 +781,27 @@ def load_seeds_from_file(path: str = SEEDS_FILE):
 def autosave_loop():
     while not stop_event.is_set():
         stop_event.wait(AUTOSAVE_SECONDS)
+        if stop_event.is_set():
+            break
         try:
             flush_records()
-            save_state()
+            save_state(sync=False)
         except Exception as e:
             print(f"[autosave] warning: {e}", file=sys.stderr)
 
 
 def graceful_shutdown(signum=None, frame=None):
+    global shutdown_started, final_state_saved
+    with shutdown_once_lock:
+        if shutdown_started:
+            return
+        shutdown_started = True
+
     print("\n[shutdown] Stopping safely...")
     stop_event.set()
     try:
         flush_records()
-        save_state()
+        final_state_saved = save_state(sync=True)
     finally:
         print(
             f"[shutdown] pages_processed={pages_processed}, "
@@ -703,7 +950,7 @@ def crawl(seeds):
                 pages_processed += 1
                 if pages_processed % SAVE_STATE_EVERY_N_PAGES == 0:
                     flush_records()
-                    save_state()
+                    save_state(sync=False)
 
                 if pages_processed % 50 == 0:
                     print(
@@ -717,11 +964,20 @@ def crawl(seeds):
 
 
 def main():
-    auto_tune_runtime()
+    global final_state_saved
+    runtime_cfg_path = runtime_config_path()
+    runtime_cfg, was_created = load_or_create_runtime_config(runtime_cfg_path)
+    auto_tune_runtime(runtime_cfg)
 
     print("[start] OSIRIS — Open Security Intelligence Recursive Internet Scraper")
     print("[start] Dynamic domain discovery enabled. Search engines excluded.")
     print(f"[start] Output JSONL: {OUTPUT_FILE}")
+    if was_created:
+        print(f"[start] Created runtime config: {runtime_cfg_path}")
+    print(
+        f"[start] Runtime profile={runtime_cfg.get('speed_profile', RUNTIME_SPEED_AUTO)} "
+        f"config={runtime_cfg_path}"
+    )
     print(
         f"[start] Runtime tuning: threads={CRAWLER_THREADS} "
         f"connection_pool={CONNECTION_POOL_SIZE} sleep_range={SLEEP_RANGE_SECONDS}"
@@ -757,8 +1013,9 @@ def main():
     finally:
         stop_event.set()
         autosave_thread.join(timeout=2)
-        flush_records()
-        save_state()
+        if not final_state_saved:
+            flush_records()
+            final_state_saved = save_state(sync=True)
 
     elapsed = time.time() - started
     print(f"[done] pages_processed={pages_processed}, rows_saved={rows_saved}, elapsed={elapsed:.1f}s")
