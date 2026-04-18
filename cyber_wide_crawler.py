@@ -172,7 +172,13 @@ _KEYWORD_RE = re.compile(
 
 # Pre-compiled priority-link pattern — avoids rebuilding a list on every call.
 _PRIORITY_RE = re.compile(
-    r"advisory|security|cve|vuln|vulnerability|exploit|incident|threat|malware|ransomware|patch",
+    r"advisory|security-advisory|cybersecurity|infosec|cve|vuln|vulnerability|exploit|incident-response|threat-intel|malware|ransomware|phishing|patch|mitre|owasp|nist|cisa|xss|sqli|sql-injection|rce|lpe|privilege-escalation|zero-day|0day|ioc",
+    re.IGNORECASE,
+)
+
+# URL/path hints used to keep crawl expansion focused on cyber content.
+_CYBER_LINK_HINT_RE = re.compile(
+    r"cyber|infosec|security-advisory|cve|vuln|vulnerability|exploit|malware|ransomware|phishing|incident-response|threat-intel|mitre|owasp|nist|cisa|xss|sqli|sql-injection|rce|lpe|privilege-escalation|zero-day|0day|ioc|yara|sigma|snort|pentest|writeup|ctf|red-team|blue-team",
     re.IGNORECASE,
 )
 
@@ -844,17 +850,27 @@ def should_prioritize_link(link: str) -> bool:
     return bool(_PRIORITY_RE.search(link))
 
 
-def record_if_relevant(url: str, title: str, text: str, code_blocks: list):
+def is_cyber_link_candidate(link: str) -> bool:
+    """Return True when a discovered URL itself looks cybersecurity-focused."""
+    try:
+        p = urlparse(link)
+        blob = f"{p.netloc} {p.path} {p.query}".lower()
+    except Exception:
+        blob = link.lower()
+    return bool(_CYBER_LINK_HINT_RE.search(blob))
+
+
+def record_if_relevant(url: str, title: str, text: str, code_blocks: list) -> bool:
     # Skip pages with almost no content (login redirects, 404s, etc.)
     if len(text) < MIN_CONTENT_LENGTH:
-        return
+        return False
 
     score = relevance_score(title, text)
 
     h = host(url)
     if score <= 0:
         domain_lowrel_streak[h] += 1
-        return
+        return False
     domain_lowrel_streak[h] = 0
 
     cves = extract_cves(title, text)
@@ -863,7 +879,7 @@ def record_if_relevant(url: str, title: str, text: str, code_blocks: list):
     # is only stored once.
     content_hash = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
     if content_hash in seen_records:
-        return
+        return True
     seen_records.add(content_hash)
 
     record = {
@@ -884,6 +900,8 @@ def record_if_relevant(url: str, title: str, text: str, code_blocks: list):
 
     if len(records_buffer) >= FLUSH_EVERY_N_RECORDS:
         flush_records()
+
+    return True
 
 
 def seed_initial(seeds):
@@ -971,10 +989,15 @@ def crawl(seeds):
                     continue
 
                 final_url, title, text, code_blocks, links = result
-                record_if_relevant(final_url, title, text, code_blocks)
+                page_is_relevant = record_if_relevant(final_url, title, text, code_blocks)
 
                 for lk in links:
-                    enqueue(lk, priority=should_prioritize_link(lk))
+                    priority = should_prioritize_link(lk)
+                    if not page_is_relevant and not priority:
+                        continue
+                    if not is_cyber_link_candidate(lk):
+                        continue
+                    enqueue(lk, priority=priority)
 
                 pages_processed += 1
                 if pages_processed % SAVE_STATE_EVERY_N_PAGES == 0:

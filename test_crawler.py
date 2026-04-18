@@ -314,8 +314,30 @@ class TestShouldPrioritizeLink(unittest.TestCase):
     def test_non_priority_link(self):
         self.assertFalse(cwc.should_prioritize_link("https://example.com/about-us"))
 
+    def test_national_security_news_not_prioritized(self):
+        self.assertFalse(
+            cwc.should_prioritize_link(
+                "https://www.washingtonpost.com/national-security/2026/04/01/trump-commando-plan-seize-iran-uranium/"
+            )
+        )
+
     def test_returns_bool(self):
         self.assertIsInstance(cwc.should_prioritize_link("https://x.com/"), bool)
+
+
+class TestCyberLinkCandidate(unittest.TestCase):
+
+    def test_cve_advisory_link_is_candidate(self):
+        self.assertTrue(
+            cwc.is_cyber_link_candidate("https://vendor.example.com/security-advisory/CVE-2026-12345")
+        )
+
+    def test_generic_news_link_is_not_candidate(self):
+        self.assertFalse(
+            cwc.is_cyber_link_candidate(
+                "https://www.washingtonpost.com/national-security/2026/04/01/trump-commando-plan-seize-iran-uranium/"
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
