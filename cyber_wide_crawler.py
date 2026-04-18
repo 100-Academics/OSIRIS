@@ -210,6 +210,31 @@ thread_local = threading.local()
 # =========================
 # HELPERS
 # =========================
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+def auto_tune_runtime():
+    """Tune runtime concurrency knobs for this machine on every start."""
+    global CRAWLER_THREADS, CONNECTION_POOL_SIZE, SLEEP_RANGE_SECONDS
+
+    cpu_count = os.cpu_count() or 4
+    tuned_threads = _clamp(cpu_count * 2, 8, 32)
+    tuned_pool = _clamp(tuned_threads * 8, 64, 256)
+
+    # Slightly lower per-request delay at higher concurrency while preserving politeness.
+    if tuned_threads >= 24:
+        tuned_sleep = (0.01, 0.05)
+    elif tuned_threads >= 16:
+        tuned_sleep = (0.015, 0.06)
+    else:
+        tuned_sleep = (0.02, 0.08)
+
+    CRAWLER_THREADS = tuned_threads
+    CONNECTION_POOL_SIZE = tuned_pool
+    SLEEP_RANGE_SECONDS = tuned_sleep
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -692,9 +717,15 @@ def crawl(seeds):
 
 
 def main():
+    auto_tune_runtime()
+
     print("[start] OSIRIS — Open Security Intelligence Recursive Internet Scraper")
     print("[start] Dynamic domain discovery enabled. Search engines excluded.")
     print(f"[start] Output JSONL: {OUTPUT_FILE}")
+    print(
+        f"[start] Runtime tuning: threads={CRAWLER_THREADS} "
+        f"connection_pool={CONNECTION_POOL_SIZE} sleep_range={SLEEP_RANGE_SECONDS}"
+    )
     print("[start] Press Ctrl+C anytime for safe save and exit.")
 
     signal.signal(signal.SIGINT, graceful_shutdown)
