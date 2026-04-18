@@ -667,7 +667,7 @@ class TestStatePersistence(unittest.TestCase):
         _clear_global_state()
 
     def test_save_and_load_round_trip(self):
-        cwc.queue.append("https://example.com/advisory/1")
+        cwc.queue.append("https://example.com/security-advisory/1")
         cwc.visited.add("https://visited.com/page")
         cwc.pages_processed = 42
         cwc.rows_saved = 7
@@ -679,7 +679,7 @@ class TestStatePersistence(unittest.TestCase):
 
         result = cwc.load_state()
         self.assertTrue(result)
-        self.assertIn("https://example.com/advisory/1", cwc.queue)
+        self.assertIn("https://example.com/security-advisory/1", cwc.queue)
         self.assertIn("https://visited.com/page", cwc.visited)
         self.assertEqual(cwc.pages_processed, 42)
         self.assertEqual(cwc.rows_saved, 7)
@@ -707,7 +707,7 @@ class TestStatePersistence(unittest.TestCase):
             f.write("{ broken")
         with open(cwc.STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
             json.dump({
-                "queue": ["https://example.com/recovered"],
+                "queue": ["https://example.com/security-advisory/recovered"],
                 "queued_set": [],
                 "visited": [],
                 "seen_records": [],
@@ -718,13 +718,13 @@ class TestStatePersistence(unittest.TestCase):
             }, f)
 
         self.assertTrue(cwc.load_state())
-        self.assertIn("https://example.com/recovered", cwc.queue)
+        self.assertIn("https://example.com/security-advisory/recovered", cwc.queue)
         self.assertEqual(cwc.pages_processed, 123)
 
     def test_load_state_prefers_newer_tmp_when_both_valid(self):
         with open(cwc.STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({
-                "queue": ["https://example.com/old"],
+                "queue": ["https://example.com/security-advisory/old"],
                 "queued_set": [],
                 "visited": [],
                 "seen_records": [],
@@ -737,7 +737,7 @@ class TestStatePersistence(unittest.TestCase):
 
         with open(cwc.STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
             json.dump({
-                "queue": ["https://example.com/new"],
+                "queue": ["https://example.com/security-advisory/new"],
                 "queued_set": [],
                 "visited": [],
                 "seen_records": [],
@@ -749,8 +749,8 @@ class TestStatePersistence(unittest.TestCase):
             }, f)
 
         self.assertTrue(cwc.load_state())
-        self.assertIn("https://example.com/new", cwc.queue)
-        self.assertNotIn("https://example.com/old", cwc.queue)
+        self.assertIn("https://example.com/security-advisory/new", cwc.queue)
+        self.assertNotIn("https://example.com/security-advisory/old", cwc.queue)
         self.assertEqual(cwc.pages_processed, 20)
 
     def test_state_written_atomically(self):
@@ -763,6 +763,58 @@ class TestStatePersistence(unittest.TestCase):
         with open(cwc.STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
         self.assertEqual(state["pages_processed"], 99)
+
+    def test_load_state_scrubs_non_cyber_invalid_and_duplicate_queue_urls(self):
+        state = {
+            "queue": [
+                "https://vendor.example.com/security-advisory/CVE-2026-1234",
+                "https://www.washingtonpost.com/national-security/2026/04/01/trump-commando-plan-seize-iran-uranium/",
+                "ftp://example.com/file",
+                "https://google.com/search?q=cve",
+                "https://vendor.example.com/security-advisory/CVE-2026-1234",
+                "https://visited.example.com/security-advisory/CVE-2026-99",
+            ],
+            "queued_set": [],
+            "visited": ["https://visited.example.com/security-advisory/CVE-2026-99"],
+            "seen_records": [],
+            "domain_page_count": {},
+            "domain_lowrel_streak": {},
+            "pages_processed": 5,
+            "rows_saved": 1,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        }
+        with open(cwc.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+        self.assertTrue(cwc.load_state())
+        self.assertEqual(list(cwc.queue), ["https://vendor.example.com/security-advisory/CVE-2026-1234"])
+        self.assertEqual(cwc.queued_set, {"https://vendor.example.com/security-advisory/CVE-2026-1234"})
+
+    def test_load_state_scrubs_queue_entries_for_capped_or_lowrel_domains(self):
+        saturated_host = "saturated.example.com"
+        noisy_host = "noisy.example.com"
+        allowed_url = "https://ok.example.com/security-advisory/CVE-2026-1"
+        state = {
+            "queue": [
+                f"https://{saturated_host}/security-advisory/CVE-2026-2",
+                f"https://{noisy_host}/security-advisory/CVE-2026-3",
+                allowed_url,
+            ],
+            "queued_set": [],
+            "visited": [],
+            "seen_records": [],
+            "domain_page_count": {saturated_host: cwc.MAX_PAGES_PER_DOMAIN},
+            "domain_lowrel_streak": {noisy_host: cwc.MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN},
+            "pages_processed": 0,
+            "rows_saved": 0,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        }
+        with open(cwc.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+        self.assertTrue(cwc.load_state())
+        self.assertEqual(list(cwc.queue), [allowed_url])
+        self.assertIn(allowed_url, cwc.queued_set)
 
     def test_permission_error_on_replace_keeps_previous_state(self):
         cwc.pages_processed = 1

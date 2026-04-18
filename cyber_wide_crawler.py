@@ -746,6 +746,44 @@ def save_state(sync: bool = True) -> bool:
                 return False
 
 
+def scrub_resumed_queue(raw_queue: list, visited_urls: set, page_counts: dict, lowrel_counts: dict) -> tuple[list, int]:
+    """Filter and dedupe resumed queue entries while preserving order."""
+    kept = []
+    seen_local = set()
+    removed = 0
+
+    for raw_url in raw_queue:
+        u = normalize_url(raw_url)
+        if not is_http(u):
+            removed += 1
+            continue
+        if is_blocked(u):
+            removed += 1
+            continue
+        if not is_cyber_link_candidate(u):
+            removed += 1
+            continue
+        if u in visited_urls:
+            removed += 1
+            continue
+        if u in seen_local:
+            removed += 1
+            continue
+
+        h = host(u)
+        if page_counts.get(h, 0) >= MAX_PAGES_PER_DOMAIN:
+            removed += 1
+            continue
+        if lowrel_counts.get(h, 0) >= MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN:
+            removed += 1
+            continue
+
+        kept.append(u)
+        seen_local.add(u)
+
+    return kept, removed
+
+
 def load_state():
     global pages_processed, rows_saved
     candidates = [STATE_FILE, STATE_FILE + ".tmp"]
@@ -777,18 +815,35 @@ def load_state():
     valid_states.sort(key=lambda x: (x[0], x[1], 1 if x[2] == STATE_FILE else 0), reverse=True)
     _, _, loaded_from, state = valid_states[0]
 
-    queue.extend(state.get("queue", []))
-    queued_set.update(state.get("queued_set", []))
-    visited.update(state.get("visited", []))
+    state_queue = state.get("queue", [])
+    state_visited = set(state.get("visited", []))
+    state_domain_page_count = state.get("domain_page_count", {})
+    state_domain_lowrel_streak = state.get("domain_lowrel_streak", {})
+
+    kept_queue, removed_queue_items = scrub_resumed_queue(
+        state_queue,
+        state_visited,
+        state_domain_page_count,
+        state_domain_lowrel_streak,
+    )
+
+    queue.extend(kept_queue)
+    queued_set.update(kept_queue)
+    visited.update(state_visited)
     seen_records.update(state.get("seen_records", []))
 
-    for k, v in state.get("domain_page_count", {}).items():
+    for k, v in state_domain_page_count.items():
         domain_page_count[k] = v
-    for k, v in state.get("domain_lowrel_streak", {}).items():
+    for k, v in state_domain_lowrel_streak.items():
         domain_lowrel_streak[k] = v
 
     pages_processed = int(state.get("pages_processed", 0))
     rows_saved = int(state.get("rows_saved", 0))
+
+    if removed_queue_items:
+        print(
+            f"[resume] scrubbed queue entries: removed={removed_queue_items} kept={len(kept_queue)}"
+        )
 
     if loaded_from != STATE_FILE:
         print(f"[resume] recovered state from {loaded_from}")
