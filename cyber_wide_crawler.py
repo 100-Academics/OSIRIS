@@ -8,6 +8,7 @@ import random
 import hashlib
 import threading
 import urllib.robotparser
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 from collections import deque, defaultdict
@@ -30,11 +31,14 @@ REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
 MAX_PAGES_TOTAL = 200000
 MAX_QUEUE_SIZE = 120000
+CRAWLER_THREADS = 16
+CONNECTION_POOL_SIZE = 200
 
 AUTOSAVE_SECONDS = 20
 FLUSH_EVERY_N_RECORDS = 25
 SAVE_STATE_EVERY_N_PAGES = 50
-SLEEP_RANGE_SECONDS = (0.1, 0.5)
+SLEEP_RANGE_SECONDS = (0.02, 0.08)
+OUTPUT_FSYNC_EVERY_N_FLUSHES = 5
 
 MAX_CONTENT_CHARS = 50000   # full cleaned body text stored in the output
 MAX_LINKS_PER_PAGE = 200
@@ -193,10 +197,14 @@ domain_lowrel_streak = defaultdict(int)
 records_buffer = []
 pages_processed = 0
 rows_saved = 0
+flush_count = 0
 
 # robots.txt: domain -> (RobotFileParser, expiry_timestamp)
 robots_cache: dict = {}
 robots_lock = threading.Lock()
+
+# Per-thread HTTP session so workers reuse keep-alive connections safely.
+thread_local = threading.local()
 
 
 # =========================
@@ -257,10 +265,22 @@ def setup_session() -> requests.Session:
         allowed_methods=frozenset(["GET", "HEAD"]),
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=60, pool_maxsize=60)
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=CONNECTION_POOL_SIZE,
+        pool_maxsize=CONNECTION_POOL_SIZE,
+    )
     s.mount("http://", adapter)
     s.mount("https://", adapter)
     s.headers.update({"User-Agent": USER_AGENT})
+    return s
+
+
+def get_thread_session() -> requests.Session:
+    s = getattr(thread_local, "session", None)
+    if s is None:
+        s = setup_session()
+        thread_local.session = s
     return s
 
 
@@ -418,7 +438,7 @@ def extract_links(base_url: str, soup: BeautifulSoup):
 
 
 def flush_records():
-    global records_buffer, rows_saved
+    global records_buffer, rows_saved, flush_count
     with save_lock:
         if not records_buffer:
             return
@@ -426,10 +446,13 @@ def flush_records():
         to_write = records_buffer
         records_buffer = []
         rows_saved += len(to_write)
+        flush_count += 1
+        should_fsync = (flush_count % OUTPUT_FSYNC_EVERY_N_FLUSHES) == 0
     with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(json.dumps(r, ensure_ascii=False) for r in to_write) + "\n")
         f.flush()
-        os.fsync(f.fileno())
+        if should_fsync:
+            os.fsync(f.fileno())
 
 
 def save_state():
@@ -567,79 +590,102 @@ def seed_initial(seeds):
         enqueue(u, priority=True)
 
 
+def fetch_page(url: str):
+    """Fetch and parse a page; return extracted fields or None when skipped/failed."""
+    session = get_thread_session()
+    try:
+        if not robots_allowed(session, url):
+            return None
+
+        r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        final_url = normalize_url(r.url)
+
+        if r.status_code < 200 or r.status_code >= 300:
+            return None
+
+        if is_blocked(final_url):
+            return None
+
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
+            return None
+
+        soup, title, text, code_blocks = extract_text_and_title(r.text, url=final_url)
+        links = extract_links(final_url, soup)
+        random.shuffle(links)
+
+        # Keep a small per-request delay for politeness while allowing concurrency.
+        time.sleep(random.uniform(*SLEEP_RANGE_SECONDS))
+        return final_url, title, text, code_blocks, links
+    except requests.RequestException as exc:
+        print(f"[warn] request failed {url}: {exc}", file=sys.stderr)
+        return None
+    except Exception as exc:
+        print(f"[warn] unexpected error {url}: {exc}", file=sys.stderr)
+        return None
+
+
 def crawl(seeds):
     global pages_processed
-
-    session = setup_session()
 
     if not queue:
         seed_initial(seeds)
 
-    while queue and not stop_event.is_set() and pages_processed < MAX_PAGES_TOTAL:
-        url = queue.popleft()
-        queued_set.discard(url)
+    in_flight = {}
+    with ThreadPoolExecutor(max_workers=CRAWLER_THREADS) as executor:
+        while not stop_event.is_set() and pages_processed < MAX_PAGES_TOTAL:
+            while (
+                len(in_flight) < CRAWLER_THREADS
+                and queue
+                and (pages_processed + len(in_flight)) < MAX_PAGES_TOTAL
+            ):
+                url = queue.popleft()
+                queued_set.discard(url)
 
-        if url in visited:
-            continue
-        if is_blocked(url):
-            continue
+                if url in visited:
+                    continue
+                if is_blocked(url):
+                    continue
 
-        h = host(url)
-        if domain_page_count[h] >= MAX_PAGES_PER_DOMAIN:
-            continue
-        if domain_lowrel_streak[h] >= MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN:
-            continue
+                h = host(url)
+                if domain_page_count[h] >= MAX_PAGES_PER_DOMAIN:
+                    continue
+                if domain_lowrel_streak[h] >= MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN:
+                    continue
 
-        visited.add(url)
-        domain_page_count[h] += 1
+                visited.add(url)
+                domain_page_count[h] += 1
+                in_flight[executor.submit(fetch_page, url)] = url
 
-        try:
-            if not robots_allowed(session, url):
+            if not in_flight:
+                if not queue:
+                    break
                 continue
 
-            r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            final_url = normalize_url(r.url)
+            done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+            for fut in done:
+                in_flight.pop(fut, None)
+                result = fut.result()
+                if not result:
+                    continue
 
-            if r.status_code < 200 or r.status_code >= 300:
-                continue
+                final_url, title, text, code_blocks, links = result
+                record_if_relevant(final_url, title, text, code_blocks)
 
-            if is_blocked(final_url):
-                continue
+                for lk in links:
+                    enqueue(lk, priority=should_prioritize_link(lk))
 
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
-                continue
+                pages_processed += 1
+                if pages_processed % SAVE_STATE_EVERY_N_PAGES == 0:
+                    flush_records()
+                    save_state()
 
-            soup, title, text, code_blocks = extract_text_and_title(r.text, url=final_url)
-            record_if_relevant(final_url, title, text, code_blocks)
+                if pages_processed % 50 == 0:
+                    print(
+                        f"[progress] pages={pages_processed} rows_saved={rows_saved} "
+                        f"queue={len(queue)} domains={len(domain_page_count)}"
+                    )
 
-            links = extract_links(final_url, soup)
-
-            # Randomize traversal for wider internet spread
-            random.shuffle(links)
-
-            for lk in links:
-                enqueue(lk, priority=should_prioritize_link(lk))
-
-            pages_processed += 1
-            if pages_processed % SAVE_STATE_EVERY_N_PAGES == 0:
-                flush_records()
-                save_state()
-
-            if pages_processed % 50 == 0:
-                print(
-                    f"[progress] pages={pages_processed} rows_saved={rows_saved} "
-                    f"queue={len(queue)} domains={len(domain_page_count)}"
-                )
-
-            time.sleep(random.uniform(*SLEEP_RANGE_SECONDS))
-
-        except requests.RequestException as exc:
-            print(f"[warn] request failed {url}: {exc}", file=sys.stderr)
-            continue
-        except Exception as exc:
-            print(f"[warn] unexpected error {url}: {exc}", file=sys.stderr)
-            continue
 
     flush_records()
     save_state()
