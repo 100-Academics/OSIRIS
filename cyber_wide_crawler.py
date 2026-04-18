@@ -799,6 +799,13 @@ def graceful_shutdown(signum=None, frame=None):
 
     print("\n[shutdown] Stopping safely...")
     stop_event.set()
+
+    # Avoid doing heavy I/O directly from an async signal handler.
+    # The normal shutdown path in main()/crawl() will flush buffered rows
+    # and persist crawler_state.json once the loop unwinds.
+    if signum is not None:
+        return
+
     try:
         flush_records()
         final_state_saved = save_state(sync=True)
@@ -807,8 +814,6 @@ def graceful_shutdown(signum=None, frame=None):
             f"[shutdown] pages_processed={pages_processed}, "
             f"rows_saved={rows_saved}, queue={len(queue)}"
         )
-        if signum is not None:
-            sys.exit(0)
 
 
 def should_prioritize_link(link: str) -> bool:
