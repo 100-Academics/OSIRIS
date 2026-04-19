@@ -36,7 +36,7 @@ USER_AGENT = "CyberWideCrawler/1.0 (public research crawler; +https://github.com
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
 MAX_PAGES_TOTAL = 200000
-MAX_QUEUE_SIZE = 120000
+MAX_QUEUE_SIZE = 100000
 CRAWLER_THREADS = 16
 CONNECTION_POOL_SIZE = 200
 
@@ -59,11 +59,17 @@ ENV_SLEEP_MAX_MS = "OSIRIS_SLEEP_MAX_MS"
 ENV_RUNTIME_CONFIG = "OSIRIS_RUNTIME_CONFIG_FILE"
 ENV_MAX_PAGES_TOTAL = "OSIRIS_MAX_PAGES_TOTAL"
 ENV_MAX_QUEUE_SIZE = "OSIRIS_MAX_QUEUE_SIZE"
+ENV_MAX_RSS_MB = "OSIRIS_MAX_RSS_MB"
 
 RUNTIME_SPEED_AUTO = "auto"
 RUNTIME_SPEED_MAX = "max"
+RUNTIME_SPEED_ULTRA_MAX = "ultra_max"
 RUNTIME_SPEED_CUSTOM = "custom"
-RUNTIME_SPEED_VALUES = {RUNTIME_SPEED_AUTO, RUNTIME_SPEED_MAX, RUNTIME_SPEED_CUSTOM}
+RUNTIME_SPEED_VALUES = {RUNTIME_SPEED_AUTO, RUNTIME_SPEED_MAX, RUNTIME_SPEED_ULTRA_MAX, RUNTIME_SPEED_CUSTOM}
+
+# Runtime-tunable HTTP retry knobs used by setup_session().
+HTTP_RETRY_TOTAL = MAX_RETRIES
+HTTP_RETRY_BACKOFF_FACTOR = 0.25
 
 MAX_CONTENT_CHARS = 50000   # full cleaned body text stored in the output
 MAX_LINKS_PER_PAGE = 200
@@ -76,6 +82,14 @@ MAX_CODE_BLOCKS = 100
 MAX_CODE_BLOCK_CHARS = 200000
 
 ROBOTS_CACHE_TTL = 3600     # seconds to cache robots.txt per domain
+
+# Hard bounds for long-running memory growth in URL/content dedupe indexes.
+MAX_VISITED_URLS_TRACKED = 1_500_000
+MAX_SEEN_CONTENT_HASHES = 1_500_000
+STATE_VISITED_SNAPSHOT_MAX = 200_000
+STATE_SEEN_SNAPSHOT_MAX = 200_000
+MEMORY_SOFT_LIMIT_RATIO = 0.88
+MEMORY_CHECK_EVERY_N_PAGES = 25
 
 # Search engines and major aggregators to exclude (avoid crawling them like a search engine)
 BLOCKED_DOMAINS = {
@@ -223,6 +237,8 @@ queue = deque()
 queued_set = set()
 visited = set()
 seen_records = set()
+visited_order = deque()
+seen_records_order = deque()
 
 domain_page_count = defaultdict(int)
 domain_lowrel_streak = defaultdict(int)
@@ -235,6 +251,7 @@ flush_count = 0
 shutdown_started = False
 final_state_saved = False
 last_state_warning = {"message": "", "at": 0.0}
+rss_soft_limit_bytes = 0
 
 # robots.txt: domain -> (RobotFileParser, expiry_timestamp)
 robots_cache: dict = {}
@@ -258,6 +275,16 @@ def _env_int(name: str, default: int, low: int = 1, high: int = 1_000_000_000) -
         if raw is None or raw == "":
             return default
         return _clamp(int(raw), low, high)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float, low: float = 0.0, high: float = 1_000_000_000.0) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return default
+        return max(low, min(high, float(raw)))
     except (TypeError, ValueError):
         return default
 
@@ -286,6 +313,8 @@ def _default_runtime_config() -> dict:
             "connection_pool": None,
             "sleep_min_ms": None,
             "sleep_max_ms": None,
+            "max_pages_total": None,
+            "max_queue_size": None,
         },
         "created_at": now_iso(),
     }
@@ -296,14 +325,14 @@ def _validate_runtime_config(raw: dict) -> dict:
     if not isinstance(raw, dict):
         return cfg
 
-    profile = str(raw.get("speed_profile", RUNTIME_SPEED_AUTO)).strip().lower()
+    profile = str(raw.get("speed_profile", RUNTIME_SPEED_AUTO)).strip().lower().replace("-", "_").replace(" ", "_")
     if profile not in RUNTIME_SPEED_VALUES:
         profile = RUNTIME_SPEED_AUTO
     cfg["speed_profile"] = profile
 
     custom = raw.get("custom") if isinstance(raw.get("custom"), dict) else {}
     out_custom = cfg["custom"]
-    for key in ("threads", "connection_pool"):
+    for key in ("threads", "connection_pool", "max_pages_total", "max_queue_size"):
         val = custom.get(key)
         if isinstance(val, int) and val > 0:
             out_custom[key] = val
@@ -343,6 +372,7 @@ def load_or_create_runtime_config(path: str = None) -> tuple[dict, bool]:
 def auto_tune_runtime(runtime_config: dict = None):
     """Tune runtime concurrency knobs for this machine on every start."""
     global CRAWLER_THREADS, CONNECTION_POOL_SIZE, SLEEP_RANGE_SECONDS
+    global HTTP_RETRY_TOTAL, HTTP_RETRY_BACKOFF_FACTOR
 
     cpu_count = os.cpu_count() or 4
     # This crawler is mostly network-bound, so higher concurrency than CPU count helps.
@@ -356,6 +386,9 @@ def auto_tune_runtime(runtime_config: dict = None):
     else:
         tuned_sleep = (0.002, 0.012)
 
+    tuned_retries = MAX_RETRIES
+    tuned_backoff = 0.25
+
     cfg = _validate_runtime_config(runtime_config or {})
     profile = cfg["speed_profile"]
 
@@ -363,6 +396,13 @@ def auto_tune_runtime(runtime_config: dict = None):
         tuned_threads = _clamp(cpu_count * 16, 64, 256)
         tuned_pool = _clamp(tuned_threads * 4, 256, 2048)
         tuned_sleep = (0.0, 0.001)
+    elif profile == RUNTIME_SPEED_ULTRA_MAX:
+        tuned_threads = _clamp(cpu_count * 20, 96, 320)
+        tuned_pool = _clamp(tuned_threads * 4, 384, 4096)
+        tuned_sleep = (0.0, 0.0)
+        # Keep minimal resilience while removing most retry/backoff delay.
+        tuned_retries = 1
+        tuned_backoff = 0.0
     elif profile == RUNTIME_SPEED_CUSTOM:
         custom = cfg["custom"]
         if custom["threads"] is not None:
@@ -406,22 +446,151 @@ def auto_tune_runtime(runtime_config: dict = None):
     CRAWLER_THREADS = tuned_threads
     CONNECTION_POOL_SIZE = tuned_pool
     SLEEP_RANGE_SECONDS = tuned_sleep
+    HTTP_RETRY_TOTAL = _clamp(int(tuned_retries), 0, 10)
+    HTTP_RETRY_BACKOFF_FACTOR = max(0.0, float(tuned_backoff))
 
 
-def apply_runtime_page_limit():
+def apply_runtime_page_limit(runtime_config: dict = None):
     """Allow the total crawl cap to be overridden at startup."""
     global MAX_PAGES_TOTAL
+    cfg = _validate_runtime_config(runtime_config or {})
+    custom = cfg.get("custom", {})
+    custom_pages = custom.get("max_pages_total") if isinstance(custom, dict) else None
+    if isinstance(custom_pages, int) and custom_pages > 0:
+        MAX_PAGES_TOTAL = _clamp(custom_pages, 1, 1_000_000_000)
     MAX_PAGES_TOTAL = _env_int(ENV_MAX_PAGES_TOTAL, MAX_PAGES_TOTAL)
 
 
-def apply_runtime_queue_limit():
+def apply_runtime_queue_limit(runtime_config: dict = None):
     """Allow the in-memory queue cap to be overridden at startup."""
     global MAX_QUEUE_SIZE
+    cfg = _validate_runtime_config(runtime_config or {})
+    custom = cfg.get("custom", {})
+    custom_queue = custom.get("max_queue_size") if isinstance(custom, dict) else None
+    if isinstance(custom_queue, int) and custom_queue > 0:
+        MAX_QUEUE_SIZE = _clamp(custom_queue, 1, 1_000_000_000)
     MAX_QUEUE_SIZE = _env_int(ENV_MAX_QUEUE_SIZE, MAX_QUEUE_SIZE)
+
+
+def _read_memtotal_bytes() -> int:
+    """Return total system RAM bytes on Linux, or 0 if unavailable."""
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _process_rss_bytes() -> int:
+    """Return current process resident memory (RSS) on Linux, or 0 if unavailable."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def apply_runtime_memory_limit():
+    """Compute crawler memory soft-limit; 0 disables checks."""
+    global rss_soft_limit_bytes
+    configured_mb = _env_float(ENV_MAX_RSS_MB, 0.0, low=0.0, high=1_000_000.0)
+    if configured_mb > 0:
+        rss_soft_limit_bytes = int(configured_mb * 1024 * 1024)
+        return
+
+    total = _read_memtotal_bytes()
+    if total > 0:
+        rss_soft_limit_bytes = int(total * MEMORY_SOFT_LIMIT_RATIO)
+    else:
+        rss_soft_limit_bytes = 0
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _bounded_set_add(value, target_set: set, order: deque, limit: int) -> bool:
+    """Insert into set with FIFO eviction so membership memory cannot grow forever."""
+    if value in target_set:
+        return False
+    if len(target_set) >= limit:
+        oldest = order.popleft()
+        target_set.discard(oldest)
+    target_set.add(value)
+    order.append(value)
+    return True
+
+
+def mark_visited(url: str) -> bool:
+    return _bounded_set_add(url, visited, visited_order, MAX_VISITED_URLS_TRACKED)
+
+
+def _content_token(content_hash_hex: str) -> int:
+    # Use first 64 bits from SHA256 hex to reduce dedupe index memory.
+    return int(content_hash_hex[:16], 16)
+
+
+def mark_seen_content(content_hash_hex: str) -> bool:
+    token = _content_token(content_hash_hex)
+    return _bounded_set_add(token, seen_records, seen_records_order, MAX_SEEN_CONTENT_HASHES)
+
+
+def maybe_stop_for_memory_pressure(where: str = "") -> bool:
+    if rss_soft_limit_bytes <= 0:
+        return False
+    rss = _process_rss_bytes()
+    if rss <= 0 or rss < rss_soft_limit_bytes:
+        return False
+    mb = rss / (1024 * 1024)
+    limit_mb = rss_soft_limit_bytes / (1024 * 1024)
+    print(
+        f"[memory] soft limit hit at {where or 'runtime'}: rss={mb:.1f}MB limit={limit_mb:.1f}MB; initiating graceful shutdown",
+        file=sys.stderr,
+    )
+    stop_event.set()
+    return True
+
+
+def _snapshot_recent_unique(order: deque, max_items: int) -> list:
+    """Take the newest unique values from an insertion-order deque."""
+    out = []
+    seen = set()
+    for value in reversed(order):
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+        if len(out) >= max_items:
+            break
+    out.reverse()
+    return out
+
+
+def _snapshot_set_with_order(target_set: set, order: deque, max_items: int) -> list:
+    """Snapshot a bounded amount of set state, preferring recency from order deque."""
+    snap = _snapshot_recent_unique(order, max_items)
+    if len(snap) >= max_items:
+        return snap
+
+    existing = set(snap)
+    for value in target_set:
+        if value in existing:
+            continue
+        snap.append(value)
+        existing.add(value)
+        if len(snap) >= max_items:
+            break
+    return snap
 
 
 def normalize_url(url: str) -> str:
@@ -467,10 +636,10 @@ def is_blocked(url: str) -> bool:
 def setup_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
-        total=MAX_RETRIES,
-        connect=MAX_RETRIES,
-        read=MAX_RETRIES,
-        backoff_factor=0.25,
+        total=HTTP_RETRY_TOTAL,
+        connect=HTTP_RETRY_TOTAL,
+        read=HTTP_RETRY_TOTAL,
+        backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=frozenset(["GET", "HEAD"]),
         raise_on_status=False,
@@ -699,11 +868,16 @@ def save_state(sync: bool = True) -> bool:
         return False
 
     with save_lock:
+        queue_snapshot = list(queue)
+        visited_snapshot = _snapshot_set_with_order(visited, visited_order, STATE_VISITED_SNAPSHOT_MAX)
+        seen_snapshot = _snapshot_set_with_order(seen_records, seen_records_order, STATE_SEEN_SNAPSHOT_MAX)
         state = {
-            "queue": list(queue),
-            "queued_set": list(queued_set),
-            "visited": list(visited),
-            "seen_records": list(seen_records),
+            "state_version": 2,
+            "queue": queue_snapshot,
+            # Compatibility key for older tooling/tests; queue drives resume behavior.
+            "queued_set": queue_snapshot,
+            "visited": visited_snapshot,
+            "seen_records": seen_snapshot,
             "domain_page_count": dict(domain_page_count),
             "domain_lowrel_streak": dict(domain_lowrel_streak),
             "pages_processed": pages_processed,
@@ -744,7 +918,7 @@ def save_state(sync: bool = True) -> bool:
                     f"[state] warning: failed to save state {STATE_FILE}: {exc}"
                 )
                 return False
-
+    return False
 
 def scrub_resumed_queue(raw_queue: list, visited_urls: set, page_counts: dict, lowrel_counts: dict) -> tuple[list, int]:
     """Filter and dedupe resumed queue entries while preserving order."""
@@ -780,6 +954,12 @@ def scrub_resumed_queue(raw_queue: list, visited_urls: set, page_counts: dict, l
 
         kept.append(u)
         seen_local.add(u)
+
+    # Respect runtime queue cap even when loading a large saved state.
+    if len(kept) > MAX_QUEUE_SIZE:
+        overflow = len(kept) - MAX_QUEUE_SIZE
+        kept = kept[:MAX_QUEUE_SIZE]
+        removed += overflow
 
     return kept, removed
 
@@ -829,8 +1009,22 @@ def load_state():
 
     queue.extend(kept_queue)
     queued_set.update(kept_queue)
-    visited.update(state_visited)
-    seen_records.update(state.get("seen_records", []))
+    for u in state_visited:
+        if is_http(u):
+            mark_visited(u)
+
+    for raw in state.get("seen_records", []):
+        token = None
+        if isinstance(raw, int):
+            token = raw
+        elif isinstance(raw, str):
+            # Backward compatibility: old states may contain full SHA256 hex strings.
+            try:
+                token = int(raw[:16], 16)
+            except Exception:
+                token = None
+        if token is not None and token not in seen_records:
+            _bounded_set_add(token, seen_records, seen_records_order, MAX_SEEN_CONTENT_HASHES)
 
     for k, v in state_domain_page_count.items():
         domain_page_count[k] = v
@@ -933,9 +1127,9 @@ def record_if_relevant(url: str, title: str, text: str, code_blocks: list) -> bo
     # Content-based dedup so the same article republished on multiple URLs
     # is only stored once.
     content_hash = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-    if content_hash in seen_records:
+    if _content_token(content_hash) in seen_records:
         return True
-    seen_records.add(content_hash)
+    mark_seen_content(content_hash)
 
     record = {
         "scraped_at_utc": now_iso(),
@@ -1027,7 +1221,7 @@ def crawl(seeds):
                 if domain_lowrel_streak[h] >= MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN:
                     continue
 
-                visited.add(url)
+                mark_visited(url)
                 domain_page_count[h] += 1
                 in_flight[executor.submit(fetch_page, url)] = url
 
@@ -1055,6 +1249,8 @@ def crawl(seeds):
                     enqueue(lk, priority=priority)
 
                 pages_processed += 1
+                if pages_processed % MEMORY_CHECK_EVERY_N_PAGES == 0 and maybe_stop_for_memory_pressure("crawl"):
+                    break
                 if pages_processed % SAVE_STATE_EVERY_N_PAGES == 0:
                     flush_records()
                     save_state(sync=False)
@@ -1075,8 +1271,9 @@ def main():
     runtime_cfg_path = runtime_config_path()
     runtime_cfg, was_created = load_or_create_runtime_config(runtime_cfg_path)
     auto_tune_runtime(runtime_cfg)
-    apply_runtime_page_limit()
-    apply_runtime_queue_limit()
+    apply_runtime_page_limit(runtime_cfg)
+    apply_runtime_queue_limit(runtime_cfg)
+    apply_runtime_memory_limit()
 
     print("[start] OSIRIS — Open Security Intelligence Recursive Internet Scraper")
     print("[start] Dynamic domain discovery enabled. Search engines excluded.")
@@ -1092,6 +1289,10 @@ def main():
         f"connection_pool={CONNECTION_POOL_SIZE} sleep_range={SLEEP_RANGE_SECONDS} "
         f"max_pages={MAX_PAGES_TOTAL} max_queue={MAX_QUEUE_SIZE}"
     )
+    if rss_soft_limit_bytes > 0:
+        print(f"[start] Memory soft limit: {rss_soft_limit_bytes // (1024 * 1024)} MB")
+    else:
+        print("[start] Memory soft limit: disabled (set OSIRIS_MAX_RSS_MB to enforce)")
     print("[start] Press Ctrl+C anytime for safe save and exit.")
 
     signal.signal(signal.SIGINT, graceful_shutdown)

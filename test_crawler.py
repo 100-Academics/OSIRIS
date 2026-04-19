@@ -350,12 +350,16 @@ class TestRuntimeSpeedConfig(unittest.TestCase):
         self._orig_threads = cwc.CRAWLER_THREADS
         self._orig_pool = cwc.CONNECTION_POOL_SIZE
         self._orig_sleep = cwc.SLEEP_RANGE_SECONDS
+        self._orig_retries = cwc.HTTP_RETRY_TOTAL
+        self._orig_retry_backoff = cwc.HTTP_RETRY_BACKOFF_FACTOR
         self._tmpdir = tempfile.mkdtemp()
 
     def tearDown(self):
         cwc.CRAWLER_THREADS = self._orig_threads
         cwc.CONNECTION_POOL_SIZE = self._orig_pool
         cwc.SLEEP_RANGE_SECONDS = self._orig_sleep
+        cwc.HTTP_RETRY_TOTAL = self._orig_retries
+        cwc.HTTP_RETRY_BACKOFF_FACTOR = self._orig_retry_backoff
 
     def test_runtime_config_created_on_first_run(self):
         path = os.path.join(self._tmpdir, "runtime_config.json")
@@ -391,6 +395,30 @@ class TestRuntimeSpeedConfig(unittest.TestCase):
         self.assertEqual(cwc.CONNECTION_POOL_SIZE, 333)
         self.assertAlmostEqual(cwc.SLEEP_RANGE_SECONDS[0], 0.001)
         self.assertAlmostEqual(cwc.SLEEP_RANGE_SECONDS[1], 0.003)
+
+    def test_ultra_max_profile_reduces_retry_overhead(self):
+        cwc.auto_tune_runtime({"speed_profile": cwc.RUNTIME_SPEED_MAX})
+        max_threads = cwc.CRAWLER_THREADS
+
+        cwc.auto_tune_runtime({"speed_profile": cwc.RUNTIME_SPEED_ULTRA_MAX})
+        self.assertGreaterEqual(cwc.CRAWLER_THREADS, max_threads)
+        self.assertEqual(cwc.HTTP_RETRY_TOTAL, 1)
+        self.assertEqual(cwc.HTTP_RETRY_BACKOFF_FACTOR, 0.0)
+
+    def test_validate_runtime_config_accepts_ultra_max_aliases(self):
+        for value in ("ultra_max", "ultra-max", "ultra max", "ULTRA MAX"):
+            cfg = cwc._validate_runtime_config({"speed_profile": value})
+            self.assertEqual(cfg["speed_profile"], cwc.RUNTIME_SPEED_ULTRA_MAX)
+
+    def test_setup_session_uses_runtime_retry_knobs(self):
+        cwc.HTTP_RETRY_TOTAL = 1
+        cwc.HTTP_RETRY_BACKOFF_FACTOR = 0.0
+        session = cwc.setup_session()
+        adapter = session.get_adapter("https://")
+        self.assertEqual(adapter.max_retries.total, 1)
+        self.assertEqual(adapter.max_retries.connect, 1)
+        self.assertEqual(adapter.max_retries.read, 1)
+        self.assertEqual(adapter.max_retries.backoff_factor, 0.0)
 
 
 class TestPageLimitConfig(unittest.TestCase):
@@ -815,6 +843,41 @@ class TestStatePersistence(unittest.TestCase):
         self.assertTrue(cwc.load_state())
         self.assertEqual(list(cwc.queue), [allowed_url])
         self.assertIn(allowed_url, cwc.queued_set)
+
+    def test_load_state_caps_resumed_queue_to_max_queue_size(self):
+        original_limit = cwc.MAX_QUEUE_SIZE
+        cwc.MAX_QUEUE_SIZE = 2
+        try:
+            state = {
+                "queue": [
+                    "https://a.example.com/security-advisory/CVE-2026-1",
+                    "https://b.example.com/security-advisory/CVE-2026-2",
+                    "https://c.example.com/security-advisory/CVE-2026-3",
+                ],
+                "queued_set": [],
+                "visited": [],
+                "seen_records": [],
+                "domain_page_count": {},
+                "domain_lowrel_streak": {},
+                "pages_processed": 0,
+                "rows_saved": 0,
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+            with open(cwc.STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+
+            self.assertTrue(cwc.load_state())
+            self.assertEqual(len(cwc.queue), 2)
+            self.assertEqual(
+                list(cwc.queue),
+                [
+                    "https://a.example.com/security-advisory/CVE-2026-1",
+                    "https://b.example.com/security-advisory/CVE-2026-2",
+                ],
+            )
+            self.assertEqual(cwc.queued_set, set(cwc.queue))
+        finally:
+            cwc.MAX_QUEUE_SIZE = original_limit
 
     def test_permission_error_on_replace_keeps_previous_state(self):
         cwc.pages_processed = 1
