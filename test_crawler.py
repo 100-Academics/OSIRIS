@@ -21,6 +21,7 @@ import json
 import os
 import tempfile
 import unittest
+import requests
 from unittest.mock import patch
 
 import cyber_wide_crawler as cwc
@@ -43,6 +44,7 @@ def _clear_global_state():
     cwc.seen_records.clear()
     cwc.domain_page_count.clear()
     cwc.domain_lowrel_streak.clear()
+    cwc.domain_timeout_strikes.clear()
     cwc.records_buffer.clear()
     cwc.pages_processed = 0
     cwc.rows_saved = 0
@@ -1032,6 +1034,41 @@ class TestStatePersistence(unittest.TestCase):
 
         self.assertEqual(mock_flush.call_count, 1)
         self.assertEqual(mock_save.call_count, 1)
+
+
+class TestFetchTransientFailures(unittest.TestCase):
+
+    def setUp(self):
+        _clear_global_state()
+
+    def tearDown(self):
+        _clear_global_state()
+
+    def test_ssl_error_counts_toward_domain_strikeout(self):
+        url = "https://broken.example.com/advisory"
+        with patch("cyber_wide_crawler.get_thread_session") as mock_session:
+            mock_session.return_value.get.side_effect = requests.exceptions.SSLError("EOF")
+            with patch("cyber_wide_crawler.robots_allowed", return_value=True):
+                cwc.fetch_page(url)
+
+        self.assertEqual(cwc.domain_timeout_strikes["broken.example.com"], 1)
+
+    def test_domain_is_deprioritized_after_repeated_transient_failures(self):
+        url = "https://flaky.example.com/advisory"
+        with patch("cyber_wide_crawler.get_thread_session") as mock_session:
+            mock_session.return_value.get.side_effect = requests.exceptions.ConnectionError("reset")
+            with patch("cyber_wide_crawler.robots_allowed", return_value=True):
+                for _ in range(cwc.MAX_TIMEOUT_STRIKES_PER_DOMAIN):
+                    cwc.fetch_page(url)
+
+        self.assertGreaterEqual(
+            cwc.domain_timeout_strikes["flaky.example.com"],
+            cwc.MAX_TIMEOUT_STRIKES_PER_DOMAIN,
+        )
+        self.assertEqual(
+            cwc.domain_lowrel_streak["flaky.example.com"],
+            cwc.MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN,
+        )
 
 
 # ---------------------------------------------------------------------------

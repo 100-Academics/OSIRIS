@@ -302,6 +302,14 @@ restart_reason = ""
 
 domain_timeout_strikes = defaultdict(int)
 
+# Network failures that are usually transient and should count toward host strike-out.
+_TRANSIENT_REQUEST_EXCEPTIONS = (
+    requests.Timeout,
+    requests.ConnectionError,
+    requests.exceptions.SSLError,
+    requests.exceptions.ChunkedEncodingError,
+)
+
 # robots.txt: domain -> (RobotFileParser, expiry_timestamp)
 robots_cache: dict = {}
 robots_lock = threading.Lock()
@@ -347,6 +355,17 @@ def _log_state_warning(message: str):
         last_state_warning["message"] = message
         last_state_warning["at"] = now
     print(message, file=sys.stderr)
+
+
+def _apply_domain_request_strike(url: str) -> tuple[str, int]:
+    """Increment per-domain transient request failures and return (host, strikes)."""
+    h = host(url)
+    domain_timeout_strikes[h] += 1
+    strikes = domain_timeout_strikes[h]
+    if strikes >= MAX_TIMEOUT_STRIKES_PER_DOMAIN:
+        # Repeated transport failures usually indicate hostile or broken endpoints.
+        domain_lowrel_streak[h] = MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN
+    return h, strikes
 
 
 def runtime_config_path() -> str:
@@ -1187,10 +1206,11 @@ def save_state(sync: bool = True) -> bool:
                 # Windows can transiently lock files (AV/indexing/backup); retry briefly.
                 if attempt >= retries:
                     _log_state_warning(
-                        f"[state] warning: failed to replace {tmp} -> {STATE_FILE}: {exc}"
+                        f"[state] warning: failed to replace {tmp} -> {STATE_FILE}: {exc} (tmp retained for recovery)"
                     )
                     return False
-                time.sleep(retry_seconds)
+                sleep_for = min(1.0, retry_seconds * (1.6 ** attempt)) + random.uniform(0.0, 0.03)
+                time.sleep(sleep_for)
             except Exception as exc:
                 _log_state_warning(
                     f"[state] warning: failed to save state {STATE_FILE}: {exc}"
@@ -1478,14 +1498,15 @@ def fetch_page(url: str):
         time.sleep(random.uniform(*SLEEP_RANGE_SECONDS))
         return final_url, title, text, code_blocks, links
     except requests.Timeout:
-        h = host(url)
-        domain_timeout_strikes[h] += 1
-        if domain_timeout_strikes[h] >= MAX_TIMEOUT_STRIKES_PER_DOMAIN:
-            # Timeout-heavy domains are deprioritized for this run.
-            domain_lowrel_streak[h] = MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN
+        _apply_domain_request_strike(url)
         return None
     except requests.RequestException as exc:
+        strikes = 0
+        if isinstance(exc, _TRANSIENT_REQUEST_EXCEPTIONS):
+            _, strikes = _apply_domain_request_strike(url)
         print(f"[warn] request failed {url}: {exc}", file=sys.stderr)
+        if strikes >= MAX_TIMEOUT_STRIKES_PER_DOMAIN:
+            print(f"[warn] domain strike-out {host(url)} transient_failures={strikes}", file=sys.stderr)
         return None
     except Exception as exc:
         print(f"[warn] unexpected error {url}: {exc}", file=sys.stderr)

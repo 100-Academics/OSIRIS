@@ -4,6 +4,12 @@
 
 A wide cybersecurity crawler that starts from a large seed list and dynamically discovers new domains across the internet — without relying on search engines. It scores pages for cybersecurity relevance, extracts CVE IDs, and writes all results to a JSONL file suitable for ML/AI training and security research.
 
+## Platform support
+
+- **Mainline OSIRIS is Linux-first** and primarily validated on Linux hosts.
+- **Windows is not treated as a fully supported target** in this main branch.
+- If you need Windows-native reliability, keep a **separate Windows fork** with Windows-specific networking/file-lock handling and CI.
+
 ---
 
 ## Features
@@ -68,13 +74,15 @@ Each line of `cyber_wide_data.jsonl` is a JSON object:
 git clone https://github.com/afterglow79/OSIRIS.git
 cd OSIRIS
 
-# Create and activate a virtual environment (recommended)
+# Linux/macOS: create and activate a virtual environment (recommended)
 python3 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 ```
+
+For Windows users: use your Windows fork and document its setup there (PowerShell env activation, TLS behavior, Defender exclusions, and state-file lock mitigations).
 
 ---
 
@@ -94,7 +102,7 @@ The crawler will:
 
 ## Safe quit and resume
 
-Press **`Ctrl+C`** at any time (or send `SIGTERM`). The crawler will:
+Press **`Ctrl+C`** at any time (or send `SIGTERM` on Linux). The crawler will:
 - Stop accepting new pages
 - Flush all buffered records to `cyber_wide_data.jsonl`
 - Save the full crawler state (queue, visited set, domain budgets) to `crawler_state.json`
