@@ -51,6 +51,9 @@ def _clear_global_state():
     cwc.final_state_saved = False
     cwc.last_state_warning["message"] = ""
     cwc.last_state_warning["at"] = 0.0
+    cwc.memory_pressure_events = 0
+    cwc.memory_hard_hit_streak = 0
+    cwc.stop_event.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +342,13 @@ class TestCyberLinkCandidate(unittest.TestCase):
             )
         )
 
+    def test_politics_tracker_url_is_not_candidate(self):
+        self.assertFalse(
+            cwc.is_cyber_link_candidate(
+                "https://www.washingtonpost.com/graphics/politics/trump-administration-appointee-tracker/database/?utm_term=.c431c3da379c:"
+            )
+        )
+
 
 # ---------------------------------------------------------------------------
 # Runtime speed config (first-run file + profiles)
@@ -395,6 +405,21 @@ class TestRuntimeSpeedConfig(unittest.TestCase):
         self.assertEqual(cwc.CONNECTION_POOL_SIZE, 333)
         self.assertAlmostEqual(cwc.SLEEP_RANGE_SECONDS[0], 0.001)
         self.assertAlmostEqual(cwc.SLEEP_RANGE_SECONDS[1], 0.003)
+
+    def test_validate_runtime_config_accepts_memory_custom_fields(self):
+        cfg = cwc._validate_runtime_config(
+            {
+                "speed_profile": cwc.RUNTIME_SPEED_CUSTOM,
+                "custom": {
+                    "max_rss_mb": 4096,
+                    "max_visited_urls_tracked": 250000,
+                    "max_seen_content_hashes": 300000,
+                },
+            }
+        )
+        self.assertEqual(cfg["custom"]["max_rss_mb"], 4096.0)
+        self.assertEqual(cfg["custom"]["max_visited_urls_tracked"], 250000)
+        self.assertEqual(cfg["custom"]["max_seen_content_hashes"], 300000)
 
     def test_ultra_max_profile_reduces_retry_overhead(self):
         cwc.auto_tune_runtime({"speed_profile": cwc.RUNTIME_SPEED_MAX})
@@ -479,6 +504,97 @@ class TestQueueLimitConfig(unittest.TestCase):
         self.assertNotIn("https://example.com/three", cwc.queued_set)
 
 
+class TestMemoryLimitConfig(unittest.TestCase):
+
+    def setUp(self):
+        self._orig_rss_limit = cwc.rss_soft_limit_bytes
+        self._orig_env = os.environ.get(cwc.ENV_MAX_RSS_MB)
+        self._orig_queue = cwc.MAX_QUEUE_SIZE
+        self._orig_visited_limit = cwc.MAX_VISITED_URLS_TRACKED
+        self._orig_seen_limit = cwc.MAX_SEEN_CONTENT_HASHES
+        self._orig_hard_ratio = cwc.memory_hard_limit_ratio
+        self._orig_hard_hits = cwc.memory_hard_hit_consecutive_required
+        _clear_global_state()
+
+    def tearDown(self):
+        cwc.rss_soft_limit_bytes = self._orig_rss_limit
+        cwc.MAX_QUEUE_SIZE = self._orig_queue
+        cwc.MAX_VISITED_URLS_TRACKED = self._orig_visited_limit
+        cwc.MAX_SEEN_CONTENT_HASHES = self._orig_seen_limit
+        cwc.memory_hard_limit_ratio = self._orig_hard_ratio
+        cwc.memory_hard_hit_consecutive_required = self._orig_hard_hits
+        if self._orig_env is None:
+            os.environ.pop(cwc.ENV_MAX_RSS_MB, None)
+        else:
+            os.environ[cwc.ENV_MAX_RSS_MB] = self._orig_env
+        _clear_global_state()
+
+    def test_low_ram_hosts_get_conservative_auto_limits(self):
+        cwc.MAX_QUEUE_SIZE = 100000
+        cwc.MAX_VISITED_URLS_TRACKED = cwc.DEFAULT_MAX_VISITED_URLS_TRACKED
+        cwc.MAX_SEEN_CONTENT_HASHES = cwc.DEFAULT_MAX_SEEN_CONTENT_HASHES
+        with patch("cyber_wide_crawler._read_memtotal_bytes", return_value=16 * (1024 ** 3)):
+            cwc.apply_runtime_memory_limit()
+
+        self.assertEqual(cwc.rss_soft_limit_bytes, 6144 * 1024 * 1024)
+        self.assertEqual(cwc.MAX_QUEUE_SIZE, 40000)
+        self.assertEqual(cwc.MAX_VISITED_URLS_TRACKED, 600000)
+        self.assertEqual(cwc.MAX_SEEN_CONTENT_HASHES, 800000)
+
+    def test_memory_limit_env_override_wins(self):
+        os.environ[cwc.ENV_MAX_RSS_MB] = "2048"
+        with patch("cyber_wide_crawler._read_memtotal_bytes", return_value=64 * (1024 ** 3)):
+            cwc.apply_runtime_memory_limit()
+        self.assertEqual(cwc.rss_soft_limit_bytes, 2048 * 1024 * 1024)
+
+    def test_custom_memory_fields_apply(self):
+        cwc.MAX_QUEUE_SIZE = 50000
+        cfg = {
+            "speed_profile": cwc.RUNTIME_SPEED_CUSTOM,
+            "custom": {
+                "max_rss_mb": 3072,
+                "max_visited_urls_tracked": 210000,
+                "max_seen_content_hashes": 220000,
+            },
+        }
+        with patch("cyber_wide_crawler._read_memtotal_bytes", return_value=16 * (1024 ** 3)):
+            cwc.apply_runtime_memory_limit(cfg)
+
+        self.assertEqual(cwc.rss_soft_limit_bytes, 3072 * 1024 * 1024)
+        self.assertEqual(cwc.MAX_VISITED_URLS_TRACKED, 210000)
+        self.assertEqual(cwc.MAX_SEEN_CONTENT_HASHES, 220000)
+
+    def test_custom_hard_limit_fields_apply(self):
+        cfg = {
+            "speed_profile": cwc.RUNTIME_SPEED_CUSTOM,
+            "custom": {
+                "max_rss_mb": 6144,
+                "hard_limit_ratio": 1.33,
+                "hard_limit_consecutive_hits": 3,
+            },
+        }
+        with patch("cyber_wide_crawler._read_memtotal_bytes", return_value=16 * (1024 ** 3)):
+            cwc.apply_runtime_memory_limit(cfg)
+
+        self.assertEqual(cwc.rss_soft_limit_bytes, 6144 * 1024 * 1024)
+        self.assertAlmostEqual(cwc.memory_hard_limit_ratio, 1.33)
+        self.assertEqual(cwc.memory_hard_hit_consecutive_required, 3)
+
+    def test_hard_limit_needs_consecutive_hits_before_shutdown(self):
+        cwc.rss_soft_limit_bytes = 100 * 1024 * 1024
+        cwc.memory_hard_limit_ratio = 1.10
+        cwc.memory_hard_hit_consecutive_required = 2
+
+        with patch("cyber_wide_crawler._process_rss_bytes", return_value=112 * 1024 * 1024):
+            first = cwc.maybe_stop_for_memory_pressure("test")
+            self.assertFalse(first)
+            self.assertFalse(cwc.stop_event.is_set())
+
+            second = cwc.maybe_stop_for_memory_pressure("test")
+            self.assertTrue(second)
+            self.assertTrue(cwc.stop_event.is_set())
+
+
 # ---------------------------------------------------------------------------
 # record_if_relevant + flush_records → valid JSONL
 # ---------------------------------------------------------------------------
@@ -515,6 +631,11 @@ class TestRecordAndFlush(unittest.TestCase):
             "https://example.com/", "Cookie recipe",
             "Mix flour and butter together with sugar.", [],
         )
+        self.assertEqual(len(cwc.records_buffer), 0)
+
+    def test_single_weak_keyword_page_not_buffered(self):
+        weak_text = "system update update update update " * 30
+        cwc.record_if_relevant("https://example.com/blog/update", "Monthly update", weak_text, [])
         self.assertEqual(len(cwc.records_buffer), 0)
 
     def test_too_short_page_not_buffered(self):

@@ -134,6 +134,7 @@ Key settings at the top of `cyber_wide_crawler.py`:
 | `MAX_PAGES_TOTAL` | 200000 | Stop after this many pages |
 | `MAX_PAGES_PER_DOMAIN` | 320 | Max pages crawled per domain |
 | `MAX_QUEUE_SIZE` | 120000 | Max URLs held in memory queue |
+| `OSIRIS_MAX_RSS_MB` | Auto by RAM tier | Soft memory ceiling before aggressive memory protection kicks in |
 | `AUTOSAVE_SECONDS` | 20 | How often to flush and save state |
 | `SLEEP_RANGE_SECONDS` | Auto-tuned | Random delay between requests |
 | `MAX_CONTENT_CHARS` | 50000 | Max chars of cleaned body text stored per page |
@@ -146,6 +147,11 @@ Throughput defaults are now auto-tuned at startup for network-bound crawling:
 - connection pool: `threads * 4` (clamped to `128..1024`)
 - short per-request jitter for politeness (also auto-tuned)
 
+Memory defaults are auto-tuned by host RAM:
+- <= 16GB RAM -> soft cap `6144 MB`, queue cap `40000`, tighter in-memory dedupe indexes
+- 17-32GB RAM -> soft cap `12288 MB`, queue cap `80000`
+- > 32GB RAM -> soft cap `min(24576 MB, 60% of RAM)` with larger index budgets
+
 On first run, OSIRIS creates `crawler_runtime_config.json` (machine-local speed profile file).
 Edit this once and it will be used on every run.
 
@@ -157,15 +163,37 @@ Edit this once and it will be used on every run.
     "threads": null,
     "connection_pool": null,
     "sleep_min_ms": null,
-    "sleep_max_ms": null
+    "sleep_max_ms": null,
+    "max_pages_total": null,
+    "max_queue_size": null,
+    "max_rss_mb": null,
+    "hard_limit_ratio": null,
+    "hard_limit_consecutive_hits": null,
+    "request_timeout_sec": null,
+    "robots_timeout_sec": null,
+    "auto_restart": null,
+    "max_auto_restarts": null,
+    "max_visited_urls_tracked": null,
+    "max_seen_content_hashes": null
   }
 }
 ```
 
+Memory guard tuning fields:
+- `max_rss_mb`: soft memory cap in MB.
+- `hard_limit_ratio`: hard cap multiplier relative to soft cap (example `1.33`).
+- `hard_limit_consecutive_hits`: how many consecutive hard-cap checks before shutdown.
+- `request_timeout_sec` / `robots_timeout_sec`: skip slow pages/domains faster.
+- `auto_restart` + `max_auto_restarts`: restart process after memory stop events.
+
 `speed_profile` values:
 - `auto` -> auto-tuned per machine (default)
+- `balanced` -> faster than `auto`, but less risky than `max`
 - `max` -> aggressive max-speed tuning for that machine
-- `custom` -> uses values from `custom`
+- `ultra_max` -> ultra-aggressive tuning with minimal retry overhead (1 retry, no backoff)
+
+Quick profile switching (no file edits):
+- `OSIRIS_SPEED_PROFILE=balanced|max|ultra_max|custom`
 
 You can override at runtime without editing code:
 
@@ -182,6 +210,11 @@ python cyber_wide_crawler.py
 ```bash
 export OSIRIS_MAX_PAGES_TOTAL=3000000
 export OSIRIS_MAX_QUEUE_SIZE=3000000
+export OSIRIS_MAX_RSS_MB=8192
+export OSIRIS_SPEED_PROFILE=balanced
+export OSIRIS_REQUEST_TIMEOUT_SEC=10
+export OSIRIS_AUTO_RESTART=1
+export OSIRIS_MAX_RESTARTS=3
 python cyber_wide_crawler.py
 ```
 

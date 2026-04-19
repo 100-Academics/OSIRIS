@@ -6,6 +6,7 @@ import time
 import signal
 import random
 import hashlib
+import gc
 import threading
 import urllib.robotparser
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -34,11 +35,14 @@ SEEDS_FILE = "seeds.txt"
 
 USER_AGENT = "CyberWideCrawler/1.0 (public research crawler; +https://github.com/100-Academics/OSIRIS)"
 REQUEST_TIMEOUT = 20
+ROBOTS_TIMEOUT = 10
 MAX_RETRIES = 3
 MAX_PAGES_TOTAL = 200000
 MAX_QUEUE_SIZE = 100000
 CRAWLER_THREADS = 16
 CONNECTION_POOL_SIZE = 200
+
+DEFAULT_MAX_QUEUE_SIZE = MAX_QUEUE_SIZE
 
 AUTOSAVE_SECONDS = 20
 FLUSH_EVERY_N_RECORDS = 100
@@ -60,12 +64,24 @@ ENV_RUNTIME_CONFIG = "OSIRIS_RUNTIME_CONFIG_FILE"
 ENV_MAX_PAGES_TOTAL = "OSIRIS_MAX_PAGES_TOTAL"
 ENV_MAX_QUEUE_SIZE = "OSIRIS_MAX_QUEUE_SIZE"
 ENV_MAX_RSS_MB = "OSIRIS_MAX_RSS_MB"
+ENV_SPEED_PROFILE = "OSIRIS_SPEED_PROFILE"
+ENV_REQUEST_TIMEOUT = "OSIRIS_REQUEST_TIMEOUT_SEC"
+ENV_AUTO_RESTART = "OSIRIS_AUTO_RESTART"
+ENV_MAX_RESTARTS = "OSIRIS_MAX_RESTARTS"
+ENV_RESTART_COUNT = "OSIRIS_RESTART_COUNT"
 
 RUNTIME_SPEED_AUTO = "auto"
+RUNTIME_SPEED_BALANCED = "balanced"
 RUNTIME_SPEED_MAX = "max"
 RUNTIME_SPEED_ULTRA_MAX = "ultra_max"
 RUNTIME_SPEED_CUSTOM = "custom"
-RUNTIME_SPEED_VALUES = {RUNTIME_SPEED_AUTO, RUNTIME_SPEED_MAX, RUNTIME_SPEED_ULTRA_MAX, RUNTIME_SPEED_CUSTOM}
+RUNTIME_SPEED_VALUES = {
+    RUNTIME_SPEED_AUTO,
+    RUNTIME_SPEED_BALANCED,
+    RUNTIME_SPEED_MAX,
+    RUNTIME_SPEED_ULTRA_MAX,
+    RUNTIME_SPEED_CUSTOM,
+}
 
 # Runtime-tunable HTTP retry knobs used by setup_session().
 HTTP_RETRY_TOTAL = MAX_RETRIES
@@ -76,6 +92,8 @@ MAX_LINKS_PER_PAGE = 200
 MAX_PAGES_PER_DOMAIN = 320
 MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN = 35
 MIN_CONTENT_LENGTH = 200    # skip stub / redirect / error pages
+MIN_RELEVANCE_SCORE = 3     # require more than a single weak keyword hit
+MIN_DISTINCT_KEYWORD_HITS = 2
 
 # Code-block extraction limits (for the code_blocks field)
 MAX_CODE_BLOCKS = 100
@@ -86,10 +104,18 @@ ROBOTS_CACHE_TTL = 3600     # seconds to cache robots.txt per domain
 # Hard bounds for long-running memory growth in URL/content dedupe indexes.
 MAX_VISITED_URLS_TRACKED = 1_500_000
 MAX_SEEN_CONTENT_HASHES = 1_500_000
+DEFAULT_MAX_VISITED_URLS_TRACKED = MAX_VISITED_URLS_TRACKED
+DEFAULT_MAX_SEEN_CONTENT_HASHES = MAX_SEEN_CONTENT_HASHES
 STATE_VISITED_SNAPSHOT_MAX = 200_000
 STATE_SEEN_SNAPSHOT_MAX = 200_000
-MEMORY_SOFT_LIMIT_RATIO = 0.88
+MEMORY_SOFT_LIMIT_RATIO = 0.60
 MEMORY_CHECK_EVERY_N_PAGES = 25
+MEMORY_HARD_LIMIT_RATIO = 1.15
+MEMORY_EXTREME_LIMIT_RATIO = 1.40
+MEMORY_HARD_HIT_CONSECUTIVE_REQUIRED = 2
+MEMORY_QUEUE_TRIM_RATIO = 0.65
+MEMORY_MAX_SOFT_EVENTS = 8
+MAX_TIMEOUT_STRIKES_PER_DOMAIN = 3
 
 # Search engines and major aggregators to exclude (avoid crawling them like a search engine)
 BLOCKED_DOMAINS = {
@@ -192,7 +218,20 @@ _PRIORITY_RE = re.compile(
 
 # URL/path hints used to keep crawl expansion focused on cyber content.
 _CYBER_LINK_HINT_RE = re.compile(
-    r"cyber|infosec|security-advisory|cve|vuln|vulnerability|exploit|malware|ransomware|phishing|incident-response|threat-intel|mitre|owasp|nist|cisa|xss|sqli|sql-injection|rce|lpe|privilege-escalation|zero-day|0day|ioc|yara|sigma|snort|pentest|writeup|ctf|red-team|blue-team",
+    r"cyber|infosec|security-advisory|vuln|vulnerability|exploit|malware|ransomware|phishing|incident-response|threat-intel|sql-injection|privilege-escalation|zero-day|0day|pentest|writeup|red-team|blue-team",
+    re.IGNORECASE,
+)
+
+# Acronyms/tokens get strict word boundaries to avoid false matches from substrings
+# like "administration" -> "nist".
+_CYBER_LINK_TOKEN_RE = re.compile(
+    r"\b(cve|mitre|owasp|nist|cisa|xss|sqli|rce|lpe|ioc|yara|sigma|snort|ctf)\b",
+    re.IGNORECASE,
+)
+
+# Common non-cyber URL sections that tend to generate noisy crawl expansions.
+_NON_CYBER_LINK_HINT_RE = re.compile(
+    r"politic|election|opinion|sports|entertainment|lifestyle|travel|food|recipe|fashion|celebrity|horoscope|weather|real-estate|shopping",
     re.IGNORECASE,
 )
 
@@ -252,6 +291,16 @@ shutdown_started = False
 final_state_saved = False
 last_state_warning = {"message": "", "at": 0.0}
 rss_soft_limit_bytes = 0
+memory_pressure_events = 0
+memory_hard_limit_ratio = MEMORY_HARD_LIMIT_RATIO
+memory_hard_hit_consecutive_required = MEMORY_HARD_HIT_CONSECUTIVE_REQUIRED
+memory_hard_hit_streak = 0
+auto_restart_enabled = False
+max_auto_restarts = 0
+restart_requested = False
+restart_reason = ""
+
+domain_timeout_strikes = defaultdict(int)
 
 # robots.txt: domain -> (RobotFileParser, expiry_timestamp)
 robots_cache: dict = {}
@@ -315,6 +364,15 @@ def _default_runtime_config() -> dict:
             "sleep_max_ms": None,
             "max_pages_total": None,
             "max_queue_size": None,
+            "max_rss_mb": None,
+            "hard_limit_ratio": None,
+            "hard_limit_consecutive_hits": None,
+            "request_timeout_sec": None,
+            "robots_timeout_sec": None,
+            "auto_restart": None,
+            "max_auto_restarts": None,
+            "max_visited_urls_tracked": None,
+            "max_seen_content_hashes": None,
         },
         "created_at": now_iso(),
     }
@@ -332,14 +390,34 @@ def _validate_runtime_config(raw: dict) -> dict:
 
     custom = raw.get("custom") if isinstance(raw.get("custom"), dict) else {}
     out_custom = cfg["custom"]
-    for key in ("threads", "connection_pool", "max_pages_total", "max_queue_size"):
+    for key in (
+        "threads",
+        "connection_pool",
+        "max_pages_total",
+        "max_queue_size",
+        "hard_limit_consecutive_hits",
+        "max_auto_restarts",
+        "max_visited_urls_tracked",
+        "max_seen_content_hashes",
+    ):
         val = custom.get(key)
         if isinstance(val, int) and val > 0:
             out_custom[key] = val
-    for key in ("sleep_min_ms", "sleep_max_ms"):
+    for key in (
+        "sleep_min_ms",
+        "sleep_max_ms",
+        "max_rss_mb",
+        "hard_limit_ratio",
+        "request_timeout_sec",
+        "robots_timeout_sec",
+    ):
         val = custom.get(key)
         if isinstance(val, (int, float)) and val >= 0:
             out_custom[key] = float(val)
+    for key in ("auto_restart",):
+        val = custom.get(key)
+        if isinstance(val, bool):
+            out_custom[key] = val
     return cfg
 
 
@@ -373,6 +451,7 @@ def auto_tune_runtime(runtime_config: dict = None):
     """Tune runtime concurrency knobs for this machine on every start."""
     global CRAWLER_THREADS, CONNECTION_POOL_SIZE, SLEEP_RANGE_SECONDS
     global HTTP_RETRY_TOTAL, HTTP_RETRY_BACKOFF_FACTOR
+    global REQUEST_TIMEOUT, ROBOTS_TIMEOUT
 
     cpu_count = os.cpu_count() or 4
     # This crawler is mostly network-bound, so higher concurrency than CPU count helps.
@@ -388,14 +467,34 @@ def auto_tune_runtime(runtime_config: dict = None):
 
     tuned_retries = MAX_RETRIES
     tuned_backoff = 0.25
+    tuned_request_timeout = 20.0
+    tuned_robots_timeout = 10.0
 
     cfg = _validate_runtime_config(runtime_config or {})
     profile = cfg["speed_profile"]
 
+    profile_override = os.getenv(ENV_SPEED_PROFILE)
+    if profile_override:
+        p = profile_override.strip().lower().replace("-", "_").replace(" ", "_")
+        if p in RUNTIME_SPEED_VALUES:
+            profile = p
+
+    if profile == RUNTIME_SPEED_BALANCED:
+        tuned_threads = _clamp(cpu_count * 12, 48, 192)
+        tuned_pool = _clamp(tuned_threads * 4, 192, 1536)
+        tuned_sleep = (0.0, 0.004)
+        tuned_retries = 2
+        tuned_backoff = 0.1
+        tuned_request_timeout = 12.0
+        tuned_robots_timeout = 6.0
     if profile == RUNTIME_SPEED_MAX:
         tuned_threads = _clamp(cpu_count * 16, 64, 256)
         tuned_pool = _clamp(tuned_threads * 4, 256, 2048)
         tuned_sleep = (0.0, 0.001)
+        tuned_retries = 2
+        tuned_backoff = 0.05
+        tuned_request_timeout = 10.0
+        tuned_robots_timeout = 5.0
     elif profile == RUNTIME_SPEED_ULTRA_MAX:
         tuned_threads = _clamp(cpu_count * 20, 96, 320)
         tuned_pool = _clamp(tuned_threads * 4, 384, 4096)
@@ -403,6 +502,8 @@ def auto_tune_runtime(runtime_config: dict = None):
         # Keep minimal resilience while removing most retry/backoff delay.
         tuned_retries = 1
         tuned_backoff = 0.0
+        tuned_request_timeout = 7.0
+        tuned_robots_timeout = 3.0
     elif profile == RUNTIME_SPEED_CUSTOM:
         custom = cfg["custom"]
         if custom["threads"] is not None:
@@ -415,6 +516,10 @@ def auto_tune_runtime(runtime_config: dict = None):
             lo = max(0.0, float(lo))
             hi = max(lo, float(hi))
             tuned_sleep = (lo / 1000.0, hi / 1000.0)
+        if custom["request_timeout_sec"] is not None:
+            tuned_request_timeout = max(1.0, float(custom["request_timeout_sec"]))
+        if custom["robots_timeout_sec"] is not None:
+            tuned_robots_timeout = max(1.0, float(custom["robots_timeout_sec"]))
 
     # Optional runtime overrides for operator control without code edits.
     try:
@@ -443,11 +548,37 @@ def auto_tune_runtime(runtime_config: dict = None):
     except ValueError:
         pass
 
+    tuned_request_timeout = _env_float(ENV_REQUEST_TIMEOUT, tuned_request_timeout, low=1.0, high=120.0)
+
     CRAWLER_THREADS = tuned_threads
     CONNECTION_POOL_SIZE = tuned_pool
     SLEEP_RANGE_SECONDS = tuned_sleep
     HTTP_RETRY_TOTAL = _clamp(int(tuned_retries), 0, 10)
     HTTP_RETRY_BACKOFF_FACTOR = max(0.0, float(tuned_backoff))
+    REQUEST_TIMEOUT = max(1.0, float(tuned_request_timeout))
+    ROBOTS_TIMEOUT = max(1.0, float(tuned_robots_timeout))
+
+
+def apply_runtime_restart_policy(runtime_config: dict = None):
+    global auto_restart_enabled, max_auto_restarts
+    cfg = _validate_runtime_config(runtime_config or {})
+    custom = cfg.get("custom") if isinstance(cfg.get("custom"), dict) else {}
+
+    auto_restart_enabled = bool(custom.get("auto_restart", False))
+    max_auto_restarts = _clamp(int(custom.get("max_auto_restarts") or 0), 0, 100)
+
+    env_restart = os.getenv(ENV_AUTO_RESTART)
+    if env_restart is not None:
+        auto_restart_enabled = str(env_restart).strip().lower() in {"1", "true", "yes", "on"}
+    max_auto_restarts = _env_int(ENV_MAX_RESTARTS, max_auto_restarts, low=0, high=100)
+
+
+def request_restart(reason: str):
+    global restart_requested, restart_reason
+    if auto_restart_enabled:
+        restart_requested = True
+        restart_reason = reason
+    stop_event.set()
 
 
 def apply_runtime_page_limit(runtime_config: dict = None):
@@ -500,19 +631,93 @@ def _process_rss_bytes() -> int:
     return 0
 
 
-def apply_runtime_memory_limit():
-    """Compute crawler memory soft-limit; 0 disables checks."""
-    global rss_soft_limit_bytes
-    configured_mb = _env_float(ENV_MAX_RSS_MB, 0.0, low=0.0, high=1_000_000.0)
-    if configured_mb > 0:
-        rss_soft_limit_bytes = int(configured_mb * 1024 * 1024)
-        return
+def _auto_memory_limits(total_ram_bytes: int) -> dict:
+    """Choose conservative defaults for low-RAM hosts while scaling up on larger machines."""
+    gib = 1024 ** 3
+    if total_ram_bytes <= 0:
+        return {
+            "max_rss_mb": 4096,
+            "max_queue_size": 30000,
+            "max_visited_urls_tracked": 500000,
+            "max_seen_content_hashes": 700000,
+        }
+    if total_ram_bytes <= (16 * gib):
+        return {
+            "max_rss_mb": 6144,
+            "max_queue_size": 40000,
+            "max_visited_urls_tracked": 600000,
+            "max_seen_content_hashes": 800000,
+        }
+    if total_ram_bytes <= (32 * gib):
+        return {
+            "max_rss_mb": 12288,
+            "max_queue_size": 80000,
+            "max_visited_urls_tracked": 1000000,
+            "max_seen_content_hashes": 1200000,
+        }
+    return {
+        "max_rss_mb": min(24576, int((total_ram_bytes * MEMORY_SOFT_LIMIT_RATIO) / (1024 * 1024))),
+        "max_queue_size": 150000,
+        "max_visited_urls_tracked": DEFAULT_MAX_VISITED_URLS_TRACKED,
+        "max_seen_content_hashes": DEFAULT_MAX_SEEN_CONTENT_HASHES,
+    }
 
-    total = _read_memtotal_bytes()
-    if total > 0:
-        rss_soft_limit_bytes = int(total * MEMORY_SOFT_LIMIT_RATIO)
+
+def _trim_bounded_index(target_set: set, order: deque, limit: int):
+    while len(target_set) > limit and order:
+        oldest = order.popleft()
+        target_set.discard(oldest)
+
+
+def apply_runtime_memory_limit(runtime_config: dict = None):
+    """Apply RAM-tiered memory defaults, then allow runtime/env overrides."""
+    global rss_soft_limit_bytes, MAX_QUEUE_SIZE
+    global MAX_VISITED_URLS_TRACKED, MAX_SEEN_CONTENT_HASHES
+    global memory_hard_limit_ratio, memory_hard_hit_consecutive_required
+
+    cfg = _validate_runtime_config(runtime_config or {})
+    custom = cfg.get("custom") if isinstance(cfg.get("custom"), dict) else {}
+
+    auto_limits = _auto_memory_limits(_read_memtotal_bytes())
+    queue_cap = int(auto_limits["max_queue_size"])
+    visited_cap = int(auto_limits["max_visited_urls_tracked"])
+    seen_cap = int(auto_limits["max_seen_content_hashes"])
+    rss_mb = float(auto_limits["max_rss_mb"])
+
+    custom_rss = custom.get("max_rss_mb")
+    if isinstance(custom_rss, (int, float)) and custom_rss > 0:
+        rss_mb = float(custom_rss)
+
+    custom_hard_ratio = custom.get("hard_limit_ratio")
+    if isinstance(custom_hard_ratio, (int, float)) and custom_hard_ratio > 1.0:
+        memory_hard_limit_ratio = max(1.05, min(2.0, float(custom_hard_ratio)))
     else:
-        rss_soft_limit_bytes = 0
+        memory_hard_limit_ratio = MEMORY_HARD_LIMIT_RATIO
+
+    custom_hard_hits = custom.get("hard_limit_consecutive_hits")
+    if isinstance(custom_hard_hits, int) and custom_hard_hits > 0:
+        memory_hard_hit_consecutive_required = _clamp(custom_hard_hits, 1, 10)
+    else:
+        memory_hard_hit_consecutive_required = MEMORY_HARD_HIT_CONSECUTIVE_REQUIRED
+
+    custom_visited = custom.get("max_visited_urls_tracked")
+    if isinstance(custom_visited, int) and custom_visited > 0:
+        visited_cap = _clamp(custom_visited, 50_000, 5_000_000)
+
+    custom_seen = custom.get("max_seen_content_hashes")
+    if isinstance(custom_seen, int) and custom_seen > 0:
+        seen_cap = _clamp(custom_seen, 50_000, 5_000_000)
+
+    configured_mb = _env_float(ENV_MAX_RSS_MB, rss_mb, low=0.0, high=1_000_000.0)
+    rss_soft_limit_bytes = int(configured_mb * 1024 * 1024) if configured_mb > 0 else 0
+
+    # Keep queue size conservative on low-memory hosts even when aggressive speed profiles are selected.
+    MAX_QUEUE_SIZE = min(MAX_QUEUE_SIZE, queue_cap)
+    MAX_VISITED_URLS_TRACKED = min(MAX_VISITED_URLS_TRACKED, visited_cap)
+    MAX_SEEN_CONTENT_HASHES = min(MAX_SEEN_CONTENT_HASHES, seen_cap)
+
+    _trim_bounded_index(visited, visited_order, MAX_VISITED_URLS_TRACKED)
+    _trim_bounded_index(seen_records, seen_records_order, MAX_SEEN_CONTENT_HASHES)
 
 
 def now_iso():
@@ -546,26 +751,87 @@ def mark_seen_content(content_hash_hex: str) -> bool:
 
 
 def maybe_stop_for_memory_pressure(where: str = "") -> bool:
+    global memory_pressure_events, MAX_VISITED_URLS_TRACKED, MAX_SEEN_CONTENT_HASHES
+    global memory_hard_hit_streak
+
     if rss_soft_limit_bytes <= 0:
         return False
     rss = _process_rss_bytes()
     if rss <= 0 or rss < rss_soft_limit_bytes:
+        memory_pressure_events = 0
+        memory_hard_hit_streak = 0
         return False
     mb = rss / (1024 * 1024)
     limit_mb = rss_soft_limit_bytes / (1024 * 1024)
+    hard_limit_bytes = int(rss_soft_limit_bytes * memory_hard_limit_ratio)
+    hard_limit_mb = hard_limit_bytes / (1024 * 1024)
+    extreme_limit_bytes = int(rss_soft_limit_bytes * MEMORY_EXTREME_LIMIT_RATIO)
+
+    if rss >= extreme_limit_bytes:
+        print(
+            f"[memory] extreme limit hit at {where or 'runtime'}: rss={mb:.1f}MB "
+            f"soft={limit_mb:.1f}MB; initiating graceful shutdown",
+            file=sys.stderr,
+        )
+        request_restart("memory_extreme")
+        return True
+
+    if rss >= hard_limit_bytes:
+        memory_hard_hit_streak += 1
+    else:
+        memory_hard_hit_streak = 0
+
+    memory_pressure_events += 1
+    flush_records()
+
+    target_q = max(2000, int(MAX_QUEUE_SIZE * MEMORY_QUEUE_TRIM_RATIO))
+    removed = 0
+    while len(queue) > target_q:
+        dropped = queue.pop()
+        queued_set.discard(dropped)
+        removed += 1
+
+    # Tighten memory-heavy indexes progressively after repeated pressure events.
+    if memory_pressure_events >= 2:
+        MAX_VISITED_URLS_TRACKED = max(200_000, int(MAX_VISITED_URLS_TRACKED * 0.90))
+        MAX_SEEN_CONTENT_HASHES = max(300_000, int(MAX_SEEN_CONTENT_HASHES * 0.90))
+        _trim_bounded_index(visited, visited_order, MAX_VISITED_URLS_TRACKED)
+        _trim_bounded_index(seen_records, seen_records_order, MAX_SEEN_CONTENT_HASHES)
+
+    gc.collect()
     print(
-        f"[memory] soft limit hit at {where or 'runtime'}: rss={mb:.1f}MB limit={limit_mb:.1f}MB; initiating graceful shutdown",
+        f"[memory] pressure at {where or 'runtime'}: rss={mb:.1f}MB soft={limit_mb:.1f}MB "
+        f"hard={hard_limit_mb:.1f}MB hard_streak={memory_hard_hit_streak} "
+        f"events={memory_pressure_events} queue_drop={removed} queue_now={len(queue)}",
         file=sys.stderr,
     )
-    stop_event.set()
-    return True
+
+    if memory_hard_hit_streak >= memory_hard_hit_consecutive_required:
+        print(
+            f"[memory] hard limit sustained for {memory_hard_hit_streak} checks; initiating graceful shutdown",
+            file=sys.stderr,
+        )
+        request_restart("memory_hard")
+        return True
+
+    if memory_pressure_events >= MEMORY_MAX_SOFT_EVENTS:
+        print(
+            "[memory] sustained pressure; initiating graceful shutdown to avoid OOM kill",
+            file=sys.stderr,
+        )
+        request_restart("memory_soft")
+        return True
+    return False
 
 
 def _snapshot_recent_unique(order: deque, max_items: int) -> list:
     """Take the newest unique values from an insertion-order deque."""
+    # Snapshot first so concurrent append/pop in crawl threads cannot mutate
+    # the deque while we iterate during autosave/state save.
+    order_snapshot = tuple(order.copy())
     out = []
     seen = set()
-    for value in reversed(order):
+    for value in reversed(order_snapshot):
         if value in seen:
             continue
         seen.add(value)
@@ -578,12 +844,14 @@ def _snapshot_recent_unique(order: deque, max_items: int) -> list:
 
 def _snapshot_set_with_order(target_set: set, order: deque, max_items: int) -> list:
     """Snapshot a bounded amount of set state, preferring recency from order deque."""
+    # Copy once so iteration cannot fail if producers mutate the live set concurrently.
+    target_snapshot = target_set.copy()
     snap = _snapshot_recent_unique(order, max_items)
     if len(snap) >= max_items:
         return snap
 
     existing = set(snap)
-    for value in target_set:
+    for value in target_snapshot:
         if value in existing:
             continue
         snap.append(value)
@@ -669,6 +937,14 @@ def relevance_score(title: str, text: str) -> int:
     score = len({m.lower() for m in _KEYWORD_RE.findall(blob)})
     score += len(_CVE_RE.findall(blob)) * 2
     return score
+
+
+def relevance_signals(title: str, text: str) -> tuple[int, int]:
+    """Return (distinct_keyword_hits, cve_count) for downstream relevance gates."""
+    blob = f"{title} {text}"
+    keyword_hits = len({m.lower() for m in _KEYWORD_RE.findall(blob)})
+    cve_count = len(_CVE_RE.findall(blob))
+    return keyword_hits, cve_count
 
 
 def extract_cves(title: str, text: str) -> list:
@@ -770,7 +1046,7 @@ def robots_allowed(session: requests.Session, url: str) -> bool:
     rp = urllib.robotparser.RobotFileParser()
     rp.set_url(robots_url)
     try:
-        resp = session.get(robots_url, timeout=10, allow_redirects=True)
+        resp = session.get(robots_url, timeout=ROBOTS_TIMEOUT, allow_redirects=True)
         if resp.status_code == 200:
             rp.parse(resp.text.splitlines())
         # 404 / other -> treat as no restrictions (rp stays unparsed -> can_fetch returns True)
@@ -868,7 +1144,9 @@ def save_state(sync: bool = True) -> bool:
         return False
 
     with save_lock:
-        queue_snapshot = list(queue)
+        # Copy containers up front to avoid iterating live deques/sets that are
+        # being mutated by the crawl loop while autosave runs.
+        queue_snapshot = list(queue.copy())
         visited_snapshot = _snapshot_set_with_order(visited, visited_order, STATE_VISITED_SNAPSHOT_MAX)
         seen_snapshot = _snapshot_set_with_order(seen_records, seen_records_order, STATE_SEEN_SNAPSHOT_MAX)
         state = {
@@ -1106,7 +1384,11 @@ def is_cyber_link_candidate(link: str) -> bool:
         blob = f"{p.netloc} {p.path} {p.query}".lower()
     except Exception:
         blob = link.lower()
-    return bool(_CYBER_LINK_HINT_RE.search(blob))
+    has_cyber_hint = bool(_CYBER_LINK_HINT_RE.search(blob) or _CYBER_LINK_TOKEN_RE.search(blob))
+    has_cve = bool(_CVE_RE.search(blob))
+    if _NON_CYBER_LINK_HINT_RE.search(blob) and not (has_cyber_hint or has_cve):
+        return False
+    return has_cyber_hint or has_cve
 
 
 def record_if_relevant(url: str, title: str, text: str, code_blocks: list) -> bool:
@@ -1114,10 +1396,15 @@ def record_if_relevant(url: str, title: str, text: str, code_blocks: list) -> bo
     if len(text) < MIN_CONTENT_LENGTH:
         return False
 
-    score = relevance_score(title, text)
+    keyword_hits, cve_count = relevance_signals(title, text)
+    score = keyword_hits + (cve_count * 2)
+    has_strong_title_or_url_signal = bool(_PRIORITY_RE.search(f"{title} {url}"))
 
     h = host(url)
-    if score <= 0:
+    if score < MIN_RELEVANCE_SCORE:
+        domain_lowrel_streak[h] += 1
+        return False
+    if keyword_hits < MIN_DISTINCT_KEYWORD_HITS and cve_count == 0 and not has_strong_title_or_url_signal:
         domain_lowrel_streak[h] += 1
         return False
     domain_lowrel_streak[h] = 0
@@ -1162,6 +1449,10 @@ def fetch_page(url: str):
     """Fetch and parse a page; return extracted fields or None when skipped/failed."""
     session = get_thread_session()
     try:
+        h = host(url)
+        if domain_timeout_strikes[h] >= MAX_TIMEOUT_STRIKES_PER_DOMAIN:
+            return None
+
         if not robots_allowed(session, url):
             return None
 
@@ -1181,10 +1472,18 @@ def fetch_page(url: str):
         soup, title, text, code_blocks = extract_text_and_title(r.text, url=final_url)
         links = extract_links(final_url, soup)
         random.shuffle(links)
+        domain_timeout_strikes[h] = 0
 
         # Keep a small per-request delay for politeness while allowing concurrency.
         time.sleep(random.uniform(*SLEEP_RANGE_SECONDS))
         return final_url, title, text, code_blocks, links
+    except requests.Timeout:
+        h = host(url)
+        domain_timeout_strikes[h] += 1
+        if domain_timeout_strikes[h] >= MAX_TIMEOUT_STRIKES_PER_DOMAIN:
+            # Timeout-heavy domains are deprioritized for this run.
+            domain_lowrel_streak[h] = MAX_CONSECUTIVE_LOW_RELEVANCE_PER_DOMAIN
+        return None
     except requests.RequestException as exc:
         print(f"[warn] request failed {url}: {exc}", file=sys.stderr)
         return None
@@ -1273,7 +1572,8 @@ def main():
     auto_tune_runtime(runtime_cfg)
     apply_runtime_page_limit(runtime_cfg)
     apply_runtime_queue_limit(runtime_cfg)
-    apply_runtime_memory_limit()
+    apply_runtime_memory_limit(runtime_cfg)
+    apply_runtime_restart_policy(runtime_cfg)
 
     print("[start] OSIRIS — Open Security Intelligence Recursive Internet Scraper")
     print("[start] Dynamic domain discovery enabled. Search engines excluded.")
@@ -1287,13 +1587,23 @@ def main():
     print(
         f"[start] Runtime tuning: threads={CRAWLER_THREADS} "
         f"connection_pool={CONNECTION_POOL_SIZE} sleep_range={SLEEP_RANGE_SECONDS} "
-        f"max_pages={MAX_PAGES_TOTAL} max_queue={MAX_QUEUE_SIZE}"
+        f"request_timeout={REQUEST_TIMEOUT:.1f}s max_pages={MAX_PAGES_TOTAL} max_queue={MAX_QUEUE_SIZE}"
+    )
+    print(
+        f"[start] Index caps: visited={MAX_VISITED_URLS_TRACKED} "
+        f"seen_content={MAX_SEEN_CONTENT_HASHES}"
     )
     if rss_soft_limit_bytes > 0:
-        print(f"[start] Memory soft limit: {rss_soft_limit_bytes // (1024 * 1024)} MB")
+        print(
+            f"[start] Memory limits: soft={rss_soft_limit_bytes // (1024 * 1024)} MB "
+            f"hard_ratio={memory_hard_limit_ratio:.2f} "
+            f"hard_hits={memory_hard_hit_consecutive_required}"
+        )
     else:
         print("[start] Memory soft limit: disabled (set OSIRIS_MAX_RSS_MB to enforce)")
     print("[start] Press Ctrl+C anytime for safe save and exit.")
+    if auto_restart_enabled:
+        print(f"[start] Auto-restart enabled (max_restarts={max_auto_restarts})")
 
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
@@ -1327,6 +1637,15 @@ def main():
         if not final_state_saved:
             flush_records()
             final_state_saved = save_state(sync=True)
+
+    if restart_requested:
+        restart_count = _env_int(ENV_RESTART_COUNT, 0, low=0, high=10_000)
+        if restart_count < max_auto_restarts:
+            next_count = restart_count + 1
+            print(f"[restart] reason={restart_reason or 'unknown'} attempt={next_count}/{max_auto_restarts}")
+            os.environ[ENV_RESTART_COUNT] = str(next_count)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        print("[restart] restart requested but max restart attempts reached; exiting")
 
     elapsed = time.time() - started
     print(f"[done] pages_processed={pages_processed}, rows_saved={rows_saved}, elapsed={elapsed:.1f}s")
