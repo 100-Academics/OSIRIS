@@ -44,8 +44,11 @@ def _clear_global_state():
     cwc.domain_page_count.clear()
     cwc.domain_lowrel_streak.clear()
     cwc.records_buffer.clear()
+    cwc.dataset_records_buffer.clear()
+    cwc.dataset_seen_urls.clear()
     cwc.pages_processed = 0
     cwc.rows_saved = 0
+    cwc.dataset_rows_saved = 0
     cwc.flush_count = 0
     cwc.shutdown_started = False
     cwc.final_state_saved = False
@@ -300,6 +303,22 @@ class TestExtractLinks(unittest.TestCase):
     def test_returns_list(self):
         soup = _make_soup("")
         self.assertIsInstance(cwc.extract_links("https://example.com/", soup), list)
+
+
+class TestExtractDatasetLinks(unittest.TestCase):
+
+    def test_extracts_dataset_extensions(self):
+        soup = _make_soup(
+            '<a href="/datasets/vulns.csv">csv</a>'
+            '<a href="https://example.com/files/feed.jsonl">jsonl</a>'
+        )
+        links = cwc.extract_dataset_links("https://example.com/start", soup)
+        self.assertIn("https://example.com/datasets/vulns.csv", links)
+        self.assertIn("https://example.com/files/feed.jsonl", links)
+
+    def test_ignores_non_dataset_links(self):
+        soup = _make_soup('<a href="/blog/post.html">post</a><a href="javascript:void(0)">bad</a>')
+        self.assertEqual(cwc.extract_dataset_links("https://example.com/", soup), [])
 
 
 # ---------------------------------------------------------------------------
@@ -613,11 +632,14 @@ class TestRecordAndFlush(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
         self._orig_output = cwc.OUTPUT_FILE
+        self._orig_dataset_output = cwc.DATASET_OUTPUT_FILE
         cwc.OUTPUT_FILE = os.path.join(self._tmpdir, "output.jsonl")
+        cwc.DATASET_OUTPUT_FILE = os.path.join(self._tmpdir, "datasets.jsonl")
         _clear_global_state()
 
     def tearDown(self):
         cwc.OUTPUT_FILE = self._orig_output
+        cwc.DATASET_OUTPUT_FILE = self._orig_dataset_output
         _clear_global_state()
 
     # ---- basic buffering / filtering ----
@@ -668,6 +690,20 @@ class TestRecordAndFlush(unittest.TestCase):
         cwc.record_if_relevant("https://nvd.nist.gov/1", RELEVANT_TITLE, RELEVANT_TEXT, [])
         cwc.flush_records()
         self.assertEqual(cwc.rows_saved, 1)
+
+    def test_dataset_links_are_flushed_to_dataset_jsonl(self):
+        cwc.record_dataset_links(
+            "https://example.com/post",
+            ["https://data.example.com/vulns.csv", "https://data.example.com/vulns.csv"],
+        )
+        cwc.flush_records()
+        self.assertEqual(cwc.dataset_rows_saved, 1)
+        with open(cwc.DATASET_OUTPUT_FILE, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source_url"], "https://example.com/post")
+        self.assertEqual(rows[0]["dataset_url"], "https://data.example.com/vulns.csv")
+        self.assertEqual(rows[0]["dataset_ext"], ".csv")
 
     def test_output_file_contains_valid_json_lines(self):
         cwc.record_if_relevant("https://nvd.nist.gov/1", RELEVANT_TITLE, RELEVANT_TEXT, ["code()"])
@@ -1010,7 +1046,7 @@ class TestStatePersistence(unittest.TestCase):
 
         with patch("cyber_wide_crawler.time.sleep", return_value=None):
             with patch("cyber_wide_crawler.os.replace", side_effect=PermissionError("locked")):
-                self.assertFalse(cwc.save_state(sync=False))
+                self.assertTrue(cwc.save_state(sync=False))
 
         # Existing on-disk state remains valid and unchanged.
         with open(cwc.STATE_FILE, encoding="utf-8") as f:
@@ -1018,6 +1054,12 @@ class TestStatePersistence(unittest.TestCase):
         self.assertEqual(state["pages_processed"], 1)
         self.assertIn("https://example.com/old", state["queue"])
         self.assertNotIn("https://example.com/new", state["queue"])
+
+        pending_snaps = [
+            p for p in os.listdir(self._tmpdir)
+            if p.startswith("state.json.pending")
+        ]
+        self.assertGreaterEqual(len(pending_snaps), 1)
 
         # In-memory queue/state is preserved; failure does not clear progress.
         self.assertEqual(cwc.pages_processed, 2)

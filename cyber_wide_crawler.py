@@ -7,7 +7,9 @@ import signal
 import random
 import hashlib
 import gc
+import ctypes
 import threading
+import itertools
 import urllib.robotparser
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -29,6 +31,7 @@ except ImportError:
 # CONFIG
 # =========================
 OUTPUT_FILE = "cyber_wide_data.jsonl"
+DATASET_OUTPUT_FILE = "cyber_wide_datasets.jsonl"
 STATE_FILE = "crawler_state.json"
 RUNTIME_CONFIG_FILE = "crawler_runtime_config.json"
 SEEDS_FILE = "seeds.txt"
@@ -86,6 +89,7 @@ RUNTIME_SPEED_VALUES = {
 # Runtime-tunable HTTP retry knobs used by setup_session().
 HTTP_RETRY_TOTAL = MAX_RETRIES
 HTTP_RETRY_BACKOFF_FACTOR = 0.25
+MAX_HTML_BYTES = 4 * 1024 * 1024
 
 MAX_CONTENT_CHARS = 50000   # full cleaned body text stored in the output
 MAX_LINKS_PER_PAGE = 200
@@ -246,6 +250,13 @@ _SKIP_EXTS = frozenset([
     ".iso", ".bin", ".rar", ".7z",
 ])
 
+# Dataset-style file extensions discovered in page links.
+_DATASET_EXTS = frozenset([
+    ".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".parquet", ".arrow", ".feather",
+    ".sqlite", ".db", ".xlsx", ".xls", ".ods", ".zip", ".gz", ".bz2", ".xz",
+    ".tar", ".7z", ".rar",
+])
+
 # Use lxml when available (trafilatura already depends on it) — roughly 3× faster
 # than html.parser for large pages; fall back transparently if not installed.
 try:
@@ -283,9 +294,12 @@ domain_page_count = defaultdict(int)
 domain_lowrel_streak = defaultdict(int)
 
 records_buffer = []
+dataset_records_buffer = []
+dataset_seen_urls = set()
 pages_processed = 0
 rows_saved = 0
 flush_count = 0
+dataset_rows_saved = 0
 
 shutdown_started = False
 final_state_saved = False
@@ -309,6 +323,7 @@ robots_inflight: dict = {}
 
 # Per-thread HTTP session so workers reuse keep-alive connections safely.
 thread_local = threading.local()
+IS_WINDOWS = os.name == "nt"
 
 
 # =========================
@@ -347,6 +362,50 @@ def _log_state_warning(message: str):
         last_state_warning["message"] = message
         last_state_warning["at"] = now
     print(message, file=sys.stderr)
+
+
+def _replace_file_with_retries(
+    src: str,
+    dst: str,
+    retries: int,
+    retry_seconds: float,
+    warning_prefix: str,
+    emit_warning: bool = True,
+) -> bool:
+    """Atomically replace dst with src, retrying transient Windows file locks."""
+    for attempt in range(retries + 1):
+        try:
+            os.replace(src, dst)
+            return True
+        except PermissionError as exc:
+            if attempt >= retries:
+                if emit_warning:
+                    _log_state_warning(f"{warning_prefix}: failed to replace {src} -> {dst}: {exc}")
+                return False
+            time.sleep(retry_seconds)
+        except Exception as exc:
+            if emit_warning:
+                _log_state_warning(f"{warning_prefix}: failed to replace {src} -> {dst}: {exc}")
+            return False
+    return False
+
+
+def _write_emergency_state_snapshot(state: dict, sync: bool = True) -> str:
+    """Write a standalone fallback snapshot without rename/replace operations."""
+    snap_path = STATE_FILE + ".pending"
+    if orjson is not None:
+        with open(snap_path, "wb") as f:
+            f.write(orjson.dumps(state))
+            if sync:
+                f.flush()
+                os.fsync(f.fileno())
+    else:
+        with open(snap_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+            if sync:
+                f.flush()
+                os.fsync(f.fileno())
+    return snap_path
 
 
 def runtime_config_path() -> str:
@@ -443,7 +502,14 @@ def load_or_create_runtime_config(path: str = None) -> tuple[dict, bool]:
             json.dump(cfg, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-    os.replace(tmp, cfg_path)
+    if not _replace_file_with_retries(
+        tmp,
+        cfg_path,
+        retries=STATE_REPLACE_RETRIES_FAST,
+        retry_seconds=STATE_REPLACE_RETRY_SECONDS_FAST,
+        warning_prefix="[runtime-config] warning",
+    ):
+        raise OSError(f"unable to update runtime config: {cfg_path}")
     return cfg, True
 
 
@@ -454,16 +520,22 @@ def auto_tune_runtime(runtime_config: dict = None):
     global REQUEST_TIMEOUT, ROBOTS_TIMEOUT
 
     cpu_count = os.cpu_count() or 4
-    # This crawler is mostly network-bound, so higher concurrency than CPU count helps.
-    tuned_threads = _clamp(cpu_count * 8, 32, 128)
-    tuned_pool = _clamp(tuned_threads * 4, 128, 1024)
-
-    if tuned_threads >= 96:
-        tuned_sleep = (0.0, 0.004)
-    elif tuned_threads >= 64:
-        tuned_sleep = (0.0, 0.008)
+    # Windows branch: favor higher network concurrency and lower pacing overhead.
+    if IS_WINDOWS:
+        tuned_threads = _clamp(cpu_count * 20, 96, 512)
+        tuned_pool = _clamp(tuned_threads * 6, 384, 4096)
+        tuned_sleep = (0.0, 0.001)
     else:
-        tuned_sleep = (0.002, 0.012)
+        # This crawler is mostly network-bound, so higher concurrency than CPU count helps.
+        tuned_threads = _clamp(cpu_count * 8, 32, 128)
+        tuned_pool = _clamp(tuned_threads * 4, 128, 1024)
+
+        if tuned_threads >= 96:
+            tuned_sleep = (0.0, 0.004)
+        elif tuned_threads >= 64:
+            tuned_sleep = (0.0, 0.008)
+        else:
+            tuned_sleep = (0.002, 0.012)
 
     tuned_retries = MAX_RETRIES
     tuned_backoff = 0.25
@@ -480,24 +552,38 @@ def auto_tune_runtime(runtime_config: dict = None):
             profile = p
 
     if profile == RUNTIME_SPEED_BALANCED:
-        tuned_threads = _clamp(cpu_count * 12, 48, 192)
-        tuned_pool = _clamp(tuned_threads * 4, 192, 1536)
-        tuned_sleep = (0.0, 0.004)
+        if IS_WINDOWS:
+            tuned_threads = _clamp(cpu_count * 24, 128, 512)
+            tuned_pool = _clamp(tuned_threads * 6, 768, 4096)
+            tuned_sleep = (0.0, 0.0005)
+        else:
+            tuned_threads = _clamp(cpu_count * 12, 48, 192)
+            tuned_pool = _clamp(tuned_threads * 4, 192, 1536)
+            tuned_sleep = (0.0, 0.004)
         tuned_retries = 2
         tuned_backoff = 0.1
         tuned_request_timeout = 12.0
         tuned_robots_timeout = 6.0
     if profile == RUNTIME_SPEED_MAX:
-        tuned_threads = _clamp(cpu_count * 16, 64, 256)
-        tuned_pool = _clamp(tuned_threads * 4, 256, 2048)
-        tuned_sleep = (0.0, 0.001)
+        if IS_WINDOWS:
+            tuned_threads = _clamp(cpu_count * 32, 160, 512)
+            tuned_pool = _clamp(tuned_threads * 6, 1024, 4096)
+            tuned_sleep = (0.0, 0.0)
+        else:
+            tuned_threads = _clamp(cpu_count * 16, 64, 256)
+            tuned_pool = _clamp(tuned_threads * 4, 256, 2048)
+            tuned_sleep = (0.0, 0.001)
         tuned_retries = 2
         tuned_backoff = 0.05
         tuned_request_timeout = 10.0
         tuned_robots_timeout = 5.0
     elif profile == RUNTIME_SPEED_ULTRA_MAX:
-        tuned_threads = _clamp(cpu_count * 20, 96, 320)
-        tuned_pool = _clamp(tuned_threads * 4, 384, 4096)
+        if IS_WINDOWS:
+            tuned_threads = _clamp(cpu_count * 40, 192, 512)
+            tuned_pool = _clamp(tuned_threads * 8, 1536, 4096)
+        else:
+            tuned_threads = _clamp(cpu_count * 20, 96, 320)
+            tuned_pool = _clamp(tuned_threads * 4, 384, 4096)
         tuned_sleep = (0.0, 0.0)
         # Keep minimal resilience while removing most retry/backoff delay.
         tuned_retries = 1
@@ -604,7 +690,29 @@ def apply_runtime_queue_limit(runtime_config: dict = None):
 
 
 def _read_memtotal_bytes() -> int:
-    """Return total system RAM bytes on Linux, or 0 if unavailable."""
+    """Return total system RAM bytes, or 0 when unavailable."""
+    if IS_WINDOWS:
+        try:
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullTotalPhys)
+        except Exception:
+            pass
+
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as f:
             for line in f:
@@ -618,7 +726,35 @@ def _read_memtotal_bytes() -> int:
 
 
 def _process_rss_bytes() -> int:
-    """Return current process resident memory (RSS) on Linux, or 0 if unavailable."""
+    """Return current process resident memory (RSS), or 0 when unavailable."""
+    if IS_WINDOWS:
+        try:
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            process = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(
+                process,
+                ctypes.byref(counters),
+                counters.cb,
+            ):
+                return int(counters.WorkingSetSize)
+        except Exception:
+            pass
+
     try:
         with open("/proc/self/status", "r", encoding="utf-8") as f:
             for line in f:
@@ -826,25 +962,38 @@ def maybe_stop_for_memory_pressure(where: str = "") -> bool:
 
 def _snapshot_recent_unique(order: deque, max_items: int) -> list:
     """Take the newest unique values from an insertion-order deque."""
-    # Snapshot first so concurrent append/pop in crawl threads cannot mutate
-    # the deque while we iterate during autosave/state save.
-    order_snapshot = tuple(order.copy())
-    out = []
-    seen = set()
-    for value in reversed(order_snapshot):
-        if value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-        if len(out) >= max_items:
-            break
-    out.reverse()
-    return out
+    if max_items <= 0:
+        return []
+    # Snapshot once so concurrent append/pop in crawl threads cannot mutate
+    # the deque while autosave/state save iterates.
+    order_snapshot = list(order.copy())
+    if len(order_snapshot) <= max_items:
+        return order_snapshot
+    return list(itertools.islice(order_snapshot, len(order_snapshot) - max_items, None))
 
 
 def _snapshot_set_with_order(target_set: set, order: deque, max_items: int) -> list:
     """Snapshot a bounded amount of set state, preferring recency from order deque."""
-    # Copy once so iteration cannot fail if producers mutate the live set concurrently.
+    # Fast path: bounded set + order deque are in lockstep during normal crawl.
+    # Validate cheaply to avoid stale order data from out-of-band test/tool mutations.
+    if len(order) == len(target_set):
+        if not target_set:
+            return []
+        order_snapshot = order.copy()
+        if order_snapshot:
+            if len(order_snapshot) <= 4096:
+                if all(value in target_set for value in order_snapshot):
+                    return _snapshot_recent_unique(order_snapshot, max_items)
+            else:
+                mid = len(order_snapshot) // 2
+                if (
+                    order_snapshot[0] in target_set
+                    and order_snapshot[-1] in target_set
+                    and order_snapshot[mid] in target_set
+                ):
+                    return _snapshot_recent_unique(order_snapshot, max_items)
+
+    # Compatibility fallback for tests/tools that mutate sets directly.
     target_snapshot = target_set.copy()
     snap = _snapshot_recent_unique(order, max_items)
     if len(snap) >= max_items:
@@ -903,6 +1052,9 @@ def is_blocked(url: str) -> bool:
 
 def setup_session() -> requests.Session:
     s = requests.Session()
+    if IS_WINDOWS:
+        # Avoid per-request proxy environment lookups on Windows for lower overhead.
+        s.trust_env = False
     retry = Retry(
         total=HTTP_RETRY_TOTAL,
         connect=HTTP_RETRY_TOTAL,
@@ -962,7 +1114,7 @@ def extract_code_blocks(soup: BeautifulSoup) -> list:
         if len(code) < 10:
             continue
         # Deduplicate — nested <pre><code> pairs produce the same text twice
-        h = hashlib.sha256(code[:200].encode("utf-8", errors="ignore")).hexdigest()
+        h = hashlib.blake2b(code[:200].encode("utf-8", errors="ignore"), digest_size=16).hexdigest()
         if h in seen_hashes:
             continue
         seen_hashes.add(h)
@@ -1113,30 +1265,98 @@ def extract_links(base_url: str, soup: BeautifulSoup):
     return links
 
 
+def extract_dataset_links(base_url: str, soup: BeautifulSoup):
+    """Extract likely dataset URLs from page anchors."""
+    found = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith(("javascript:", "mailto:", "tel:")):
+            continue
+        full = normalize_url(urljoin(base_url, href))
+        if not is_http(full) or is_blocked(full):
+            continue
+        p = urlparse(full)
+        ext = os.path.splitext(p.path)[1].lower()
+        if ext not in _DATASET_EXTS:
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        found.append(full)
+        if len(found) >= MAX_LINKS_PER_PAGE:
+            break
+    return found
+
+
+def record_dataset_links(source_url: str, dataset_links: list[str]):
+    """Buffer deduplicated dataset-link records for periodic JSONL flush."""
+    if not dataset_links:
+        return
+    source = normalize_url(source_url)
+    source_domain = host(source)
+    for dataset_url in dataset_links:
+        u = normalize_url(dataset_url)
+        if not is_http(u):
+            continue
+        if u in dataset_seen_urls:
+            continue
+        dataset_seen_urls.add(u)
+        p = urlparse(u)
+        dataset_records_buffer.append(
+            {
+                "discovered_at_utc": now_iso(),
+                "source_url": source,
+                "source_domain": source_domain,
+                "dataset_url": u,
+                "dataset_domain": host(u),
+                "dataset_ext": os.path.splitext(p.path)[1].lower(),
+            }
+        )
+
+
 def flush_records():
-    global records_buffer, rows_saved, flush_count
+    global records_buffer, rows_saved, flush_count, dataset_records_buffer, dataset_rows_saved
     with save_lock:
-        if not records_buffer:
+        if not records_buffer and not dataset_records_buffer:
             return
         # Swap buffer atomically so new appends go to a fresh list while we write the old one
         to_write = records_buffer
         records_buffer = []
+        to_write_datasets = dataset_records_buffer
+        dataset_records_buffer = []
         rows_saved += len(to_write)
+        dataset_rows_saved += len(to_write_datasets)
         flush_count += 1
         should_fsync = (flush_count % OUTPUT_FSYNC_EVERY_N_FLUSHES) == 0
-    if orjson is not None:
-        payload = b"".join(orjson.dumps(r) + b"\n" for r in to_write)
-        with open(OUTPUT_FILE, "ab") as f:
-            f.write(payload)
-            f.flush()
-            if should_fsync:
-                os.fsync(f.fileno())
-    else:
-        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-            f.write("\n".join(json.dumps(r, ensure_ascii=False) for r in to_write) + "\n")
-            f.flush()
-            if should_fsync:
-                os.fsync(f.fileno())
+    if to_write:
+        if orjson is not None:
+            payload = b"".join(orjson.dumps(r) + b"\n" for r in to_write)
+            with open(OUTPUT_FILE, "ab") as f:
+                f.write(payload)
+                f.flush()
+                if should_fsync:
+                    os.fsync(f.fileno())
+        else:
+            with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                f.write("\n".join(json.dumps(r, ensure_ascii=False) for r in to_write) + "\n")
+                f.flush()
+                if should_fsync:
+                    os.fsync(f.fileno())
+    if to_write_datasets:
+        if orjson is not None:
+            payload = b"".join(orjson.dumps(r) + b"\n" for r in to_write_datasets)
+            with open(DATASET_OUTPUT_FILE, "ab") as f:
+                f.write(payload)
+                f.flush()
+                if should_fsync:
+                    os.fsync(f.fileno())
+        else:
+            with open(DATASET_OUTPUT_FILE, "a", encoding="utf-8") as f:
+                f.write("\n".join(json.dumps(r, ensure_ascii=False) for r in to_write_datasets) + "\n")
+                f.flush()
+                if should_fsync:
+                    os.fsync(f.fileno())
 
 
 def save_state(sync: bool = True) -> bool:
@@ -1160,6 +1380,7 @@ def save_state(sync: bool = True) -> bool:
             "domain_lowrel_streak": dict(domain_lowrel_streak),
             "pages_processed": pages_processed,
             "rows_saved": rows_saved,
+            "dataset_rows_saved": dataset_rows_saved,
             "timestamp": now_iso(),
         }
         tmp = STATE_FILE + ".tmp"
@@ -1179,24 +1400,62 @@ def save_state(sync: bool = True) -> bool:
         retries = STATE_REPLACE_RETRIES_SYNC if sync else STATE_REPLACE_RETRIES_FAST
         retry_seconds = STATE_REPLACE_RETRY_SECONDS_SYNC if sync else STATE_REPLACE_RETRY_SECONDS_FAST
 
-        for attempt in range(retries + 1):
-            try:
-                os.replace(tmp, STATE_FILE)
-                return True
-            except PermissionError as exc:
-                # Windows can transiently lock files (AV/indexing/backup); retry briefly.
-                if attempt >= retries:
-                    _log_state_warning(
-                        f"[state] warning: failed to replace {tmp} -> {STATE_FILE}: {exc}"
-                    )
-                    return False
-                time.sleep(retry_seconds)
-            except Exception as exc:
-                _log_state_warning(
-                    f"[state] warning: failed to save state {STATE_FILE}: {exc}"
-                )
-                return False
+        if _replace_file_with_retries(
+            tmp,
+            STATE_FILE,
+            retries=retries,
+            retry_seconds=retry_seconds,
+            warning_prefix="[state] warning",
+            emit_warning=False,
+        ):
+            return True
+
+        # Fallback for Windows file-lock contention: keep newest state in a sidecar
+        # file so resume can still recover even if STATE_FILE cannot be replaced now.
+        pending = STATE_FILE + ".pending"
+        if _replace_file_with_retries(
+            tmp,
+            pending,
+            retries=2,
+            retry_seconds=STATE_REPLACE_RETRY_SECONDS_FAST,
+            warning_prefix="[state] warning",
+            emit_warning=False,
+        ):
+            print(f"[state] info: main state locked; wrote fallback snapshot to {pending}", file=sys.stderr)
+            return True
+
+        try:
+            snap_path = _write_emergency_state_snapshot(state, sync=sync)
+            print(f"[state] info: wrote emergency snapshot to {snap_path}", file=sys.stderr)
+            return True
+        except Exception:
+            pass
+
+        _log_state_warning(
+            f"[state] warning: failed to save state to both {STATE_FILE} and {pending}"
+        )
     return False
+
+
+def install_signal_handlers():
+    """Install shutdown handlers supported by the current platform."""
+    signal.signal(signal.SIGINT, graceful_shutdown)
+
+    # SIGTERM is not consistently available/usable on Windows consoles.
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        try:
+            signal.signal(sigterm, graceful_shutdown)
+        except (ValueError, OSError):
+            pass
+
+    # Windows console Ctrl+Break support (if available in this interpreter).
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        try:
+            signal.signal(sigbreak, graceful_shutdown)
+        except (ValueError, OSError):
+            pass
 
 def scrub_resumed_queue(raw_queue: list, visited_urls: set, page_counts: dict, lowrel_counts: dict) -> tuple[list, int]:
     """Filter and dedupe resumed queue entries while preserving order."""
@@ -1243,8 +1502,8 @@ def scrub_resumed_queue(raw_queue: list, visited_urls: set, page_counts: dict, l
 
 
 def load_state():
-    global pages_processed, rows_saved
-    candidates = [STATE_FILE, STATE_FILE + ".tmp"]
+    global pages_processed, rows_saved, dataset_rows_saved
+    candidates = [STATE_FILE, STATE_FILE + ".tmp", STATE_FILE + ".pending"]
     valid_states = []
 
     for path in candidates:
@@ -1311,6 +1570,7 @@ def load_state():
 
     pages_processed = int(state.get("pages_processed", 0))
     rows_saved = int(state.get("rows_saved", 0))
+    dataset_rows_saved = int(state.get("dataset_rows_saved", 0))
 
     if removed_queue_items:
         print(
@@ -1396,7 +1656,10 @@ def record_if_relevant(url: str, title: str, text: str, code_blocks: list) -> bo
     if len(text) < MIN_CONTENT_LENGTH:
         return False
 
-    keyword_hits, cve_count = relevance_signals(title, text)
+    blob = f"{title} {text}"
+    keyword_hits = len({m.lower() for m in _KEYWORD_RE.findall(blob)})
+    cve_matches = {m.upper() for m in _CVE_RE.findall(blob)}
+    cve_count = len(cve_matches)
     score = keyword_hits + (cve_count * 2)
     has_strong_title_or_url_signal = bool(_PRIORITY_RE.search(f"{title} {url}"))
 
@@ -1409,7 +1672,7 @@ def record_if_relevant(url: str, title: str, text: str, code_blocks: list) -> bo
         return False
     domain_lowrel_streak[h] = 0
 
-    cves = extract_cves(title, text)
+    cves = sorted(cve_matches)
 
     # Content-based dedup so the same article republished on multiple URLs
     # is only stored once.
@@ -1469,14 +1732,23 @@ def fetch_page(url: str):
         if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
             return None
 
+        # Skip very large HTML responses; they are usually low-yield and expensive to parse.
+        content_length = r.headers.get("Content-Length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_HTML_BYTES:
+                    return None
+            except (TypeError, ValueError):
+                pass
+
         soup, title, text, code_blocks = extract_text_and_title(r.text, url=final_url)
         links = extract_links(final_url, soup)
-        random.shuffle(links)
+        dataset_links = extract_dataset_links(final_url, soup)
         domain_timeout_strikes[h] = 0
 
         # Keep a small per-request delay for politeness while allowing concurrency.
         time.sleep(random.uniform(*SLEEP_RANGE_SECONDS))
-        return final_url, title, text, code_blocks, links
+        return final_url, title, text, code_blocks, links, dataset_links
     except requests.Timeout:
         h = host(url)
         domain_timeout_strikes[h] += 1
@@ -1536,8 +1808,9 @@ def crawl(seeds):
                 if not result:
                     continue
 
-                final_url, title, text, code_blocks, links = result
+                final_url, title, text, code_blocks, links, dataset_links = result
                 page_is_relevant = record_if_relevant(final_url, title, text, code_blocks)
+                record_dataset_links(final_url, dataset_links)
 
                 for lk in links:
                     priority = should_prioritize_link(lk)
@@ -1578,6 +1851,7 @@ def main():
     print("[start] OSIRIS — Open Security Intelligence Recursive Internet Scraper")
     print("[start] Dynamic domain discovery enabled. Search engines excluded.")
     print(f"[start] Output JSONL: {OUTPUT_FILE}")
+    print(f"[start] Dataset JSONL: {DATASET_OUTPUT_FILE}")
     if was_created:
         print(f"[start] Created runtime config: {runtime_cfg_path}")
     print(
@@ -1605,8 +1879,7 @@ def main():
     if auto_restart_enabled:
         print(f"[start] Auto-restart enabled (max_restarts={max_auto_restarts})")
 
-    signal.signal(signal.SIGINT, graceful_shutdown)
-    signal.signal(signal.SIGTERM, graceful_shutdown)
+    install_signal_handlers()
 
     # Load seeds: prefer seeds.txt; fall back to built-in defaults
     seeds = load_seeds_from_file(SEEDS_FILE)
@@ -1648,8 +1921,11 @@ def main():
         print("[restart] restart requested but max restart attempts reached; exiting")
 
     elapsed = time.time() - started
-    print(f"[done] pages_processed={pages_processed}, rows_saved={rows_saved}, elapsed={elapsed:.1f}s")
-    print(f"[done] JSONL={OUTPUT_FILE}  STATE={STATE_FILE}")
+    print(
+        f"[done] pages_processed={pages_processed}, rows_saved={rows_saved}, "
+        f"dataset_rows_saved={dataset_rows_saved}, elapsed={elapsed:.1f}s"
+    )
+    print(f"[done] JSONL={OUTPUT_FILE}  DATASETS={DATASET_OUTPUT_FILE}  STATE={STATE_FILE}")
 
 
 if __name__ == "__main__":

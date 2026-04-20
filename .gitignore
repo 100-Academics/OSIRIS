@@ -5,6 +5,7 @@ cyber_wide_data.csv
 # Crawler state (resume file)
 crawler_state.json
 crawler_state.json.tmp
+crawler_state.json.pending
 
 # Machine-local runtime tuning profile
 crawler_runtime_config.json

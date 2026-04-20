@@ -13,6 +13,7 @@ A wide cybersecurity crawler that starts from a large seed list and dynamically 
 - **Relevance scoring** — ranks pages using 190+ cybersecurity keywords (CVE, exploit, shellcode, buffer overflow, ssrf, pentest, ctf, metasploit, UAC bypass, sudo abuse, etc.); CVE mentions add extra weight
 - **CVE extraction** — finds all `CVE-YYYY-NNNNN` identifiers per page and stores them as a proper JSON array
 - **Code block extraction** — separately captures `<pre>` / `<code>` snippets (PoC exploits, shellcode, YARA rules, config examples) in a dedicated field
+- **Dataset discovery logging** — captures dataset-style links discovered on crawled pages and writes them to a separate JSONL file
 - **Content deduplication** — SHA-256 of the cleaned body text prevents the same article (syndicated on multiple sites) from appearing twice in the dataset
 - **JSONL output** — one JSON record per line, ideal for ML training pipelines (HuggingFace `datasets`, OpenAI fine-tuning, PyTorch DataLoader)
 - **robots.txt compliance** — fetches and caches each domain's `robots.txt` (TTL 1 hour); skips disallowed URLs
@@ -58,6 +59,12 @@ Each line of `cyber_wide_data.jsonl` is a JSON object:
 | `content` | Full cleaned article body (up to 50 000 characters); boilerplate stripped by trafilatura |
 | `content_snippet` | First 1200 characters of `content`; convenience field for quick inspection |
 | `code_blocks` | Array of code snippets extracted from `<pre>`/`<code>` tags (PoC, shellcode, scripts, rules) |
+
+Dataset links found during crawling are written to `cyber_wide_datasets.jsonl` as JSONL records with:
+- `discovered_at_utc`
+- `source_url` / `source_domain`
+- `dataset_url` / `dataset_domain`
+- `dataset_ext`
 
 ---
 
@@ -106,6 +113,31 @@ python cyber_wide_crawler.py
 ```
 
 It automatically detects `crawler_state.json` and picks up from where it left off.
+
+### Windows note: `state.json` / `crawler_state.json` locked
+
+On Windows, antivirus/indexers/backup tools can briefly lock the state file during autosave.
+When this happens, OSIRIS writes a fallback snapshot to `crawler_state.json.pending`
+and resumes from the freshest valid state file on next start.
+
+If you keep seeing lock messages for a long time, usually one of these fixes it:
+
+```powershell
+# 1) Stop all running crawler processes first
+Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# 2) Check for stale state files (from the project root)
+Get-ChildItem .\crawler_state.json*
+
+# 3) Start again (resume logic will pick the newest valid state)
+python .\cyber_wide_crawler.py
+```
+
+If needed, you can keep only the newest state artifacts manually:
+
+```powershell
+Get-ChildItem .\crawler_state.json* | Sort-Object LastWriteTime -Descending
+```
 
 ---
 
@@ -288,6 +320,18 @@ The test suite covers relevance scoring, CVE extraction, HTML parsing, link filt
 - `relevance_score`
 - `record_if_relevant` + `flush_records`
 
+Fastest Windows options (no env var setup needed):
+
+```powershell
+python .\run_benchmarks.py
+```
+
+or directly:
+
+```powershell
+python .\test_benchmark.py
+```
+
 PowerShell:
 
 ```powershell
@@ -298,6 +342,17 @@ Remove-Item Env:OSIRIS_RUN_BENCH
 
 The benchmark tests print average latency, median latency, best latency, and operations/second for each benchmark case.
 They run in a temporary sandbox and redirect writes away from the default `cyber_wide_data.jsonl` and `crawler_state.json` files.
+
+## Count stored tokens
+
+Use `count_stored_tokens.py` to estimate how many tokens are currently stored in your JSONL output:
+
+```powershell
+python .\count_stored_tokens.py
+python .\count_stored_tokens.py --file .\cyber_wide_data.jsonl --fields title content code_blocks
+```
+
+The script prints row count, total approximate tokens, and average tokens per row.
 
 ---
 

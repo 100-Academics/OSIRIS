@@ -95,7 +95,9 @@ def _run_benchmark(name: str, iterations: int, fn):
     )
 
 
-BENCH_ENABLED = os.getenv("OSIRIS_RUN_BENCH") == "1"
+# Enable benchmarks either explicitly via env var (for unittest discovery)
+# or when this file is executed directly.
+BENCH_ENABLED = (os.getenv("OSIRIS_RUN_BENCH") == "1") or (__name__ == "__main__")
 
 
 @unittest.skipUnless(BENCH_ENABLED, "Set OSIRIS_RUN_BENCH=1 to run benchmark tests")
